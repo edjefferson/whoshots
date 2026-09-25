@@ -37,14 +37,37 @@ def parse_seasons(spec):
 
 
 def episode_dirs(rows):
-    """Folder for each row, numbered by its position in its season."""
-    dirs, count = [], {}
+    """Folder for each row, numbered by its position in its season.
+
+    A row covering several parts (the condensed Marco Polo recon) takes the
+    numbers of those parts, e.g. "14-20 - Marco Polo (condensed recon)".
+    """
+    dirs, count, numbers = [], {}, {}
     for r in rows:
-        season = int(r["season"])
-        count[season] = count.get(season, 0) + 1
-        dirs.append(Path(PROGRAMME, f"Season {season:02d}",
-                         f"{count[season]:02d} - {safe(r['serial'])}, Part {r['part']}"))
+        if r["part"].isdigit():
+            season = int(r["season"])
+            count[season] = count.get(season, 0) + 1
+            numbers[(season, r["serial"], int(r["part"]))] = count[season]
+    for r in rows:
+        season = Path(PROGRAMME, f"Season {int(r['season']):02d}")
+        if r["part"].isdigit():
+            n = numbers[(int(r["season"]), r["serial"], int(r["part"]))]
+            dirs.append(season / f"{n:02d} - {safe(r['serial'])}, Part {r['part']}")
+        else:
+            lo, hi = (int(x) for x in r["part"].split("-"))
+            first, last = (numbers[(int(r["season"]), r["serial"], p)] for p in (lo, hi))
+            label = "condensed recon" if "condensed" in r["version"] else f"Parts {r['part']}"
+            dirs.append(season / f"{first:02d}-{last:02d} - {safe(r['serial'])} ({label})")
     return dirs
+
+
+def animated_only(rows):
+    """Stories whose only available versions are animations."""
+    stories = {}
+    for r in rows:
+        if r["file"]:
+            stories.setdefault((r["season"], r["serial"]), []).append(r["version"].startswith("animation"))
+    return {story for story, animated in stories.items() if all(animated)}
 
 
 def short(name):
@@ -104,6 +127,7 @@ def main():
     ap.add_argument("root", type=Path, help="library folder the CSV's paths are relative to")
     ap.add_argument("--csv", type=Path, default=HERE / "episodes.csv", help="from catalogue.py")
     ap.add_argument("-s", "--seasons", default="1-26", help="e.g. 7-26 or 1,3,7-9 (default: all)")
+    ap.add_argument("-q", "--quiet", action="store_true", help="don't list the episodes being skipped")
     ap.add_argument("-o", "--output", type=Path, default=HERE / "output",
                     help="where screenshots go (default: ./output); copies go in its .downloads folder")
     ap.add_argument("--limit", type=int, help="only do the first N episodes")
@@ -114,11 +138,17 @@ def main():
         rows = list(csv.DictReader(f))
     dirs = dict(zip(map(id, rows), episode_dirs(rows)))  # before filtering, so numbering is stable
     seasons = parse_seasons(args.seasons)
+    animated = animated_only(rows)
     rows = [r for r in rows if int(r["season"]) in seasons]
+    for story in sorted(animated, key=lambda s: (int(s[0]), s[1])):
+        if int(story[0]) in seasons:
+            print(f"Skipping {story[1]}: only animated versions available")
+    rows = [r for r in rows if (r["season"], r["serial"]) not in animated]
     for r in rows:
         if not r["file"] or r["has_subs"] != "yes":
             why = "no file" if not r["file"] else "no subtitles"
-            print(f"Skipping {short(dirs[id(r)])}: {why}")
+            if not args.quiet:
+                print(f"Skipping {short(dirs[id(r)])}: {why}")
     rows = [r for r in rows if r["file"] and r["has_subs"] == "yes"]
     todo = [r for r in rows if not (args.output / dirs[id(r)] / DONE_MARKER).exists()]
     if args.limit:
