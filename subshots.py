@@ -16,6 +16,7 @@ import argparse
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -142,20 +143,65 @@ def bitmap_cues(video, track, start_time):
     return cues
 
 
+# --- Frame choice -----------------------------------------------------------
+
+SHARPNESS_SIZE = (640, 480)
+
+
+def sharpness(gray_bytes):
+    from PIL import Image, ImageFilter, ImageStat
+
+    img = Image.frombytes("L", SHARPNESS_SIZE, gray_bytes)
+    return ImageStat.Stat(img.filter(ImageFilter.FIND_EDGES)).var[0]
+
+
+def sharpest_frame_time(video, cue, window, start_time, deinterlace):
+    """Time of the sharpest frame within `window` seconds of the cue's midpoint.
+
+    The exact midpoint often lands on a motion-blurred frame; nearby frames can
+    be much crisper. Stays inside the cue so the subtitle is still showing.
+    """
+    lo = max(cue.start + 0.05, cue.mid - window)
+    hi = min(cue.end - 0.05, cue.mid + window)
+    if window <= 0 or hi <= lo:
+        return cue.mid
+    w, h = SHARPNESS_SIZE
+    filters = (["bwdif"] if deinterlace else []) + [f"scale={w}:{h}", "format=gray", "showinfo"]
+    proc = run([
+        "ffmpeg", "-hide_banner", "-ss", f"{lo:.3f}", "-t", f"{hi - lo:.3f}", "-copyts",
+        "-i", str(video), "-map", "0:v:0", "-vf", ",".join(filters),
+        "-f", "rawvideo", "-",
+    ])
+    times = [float(x) - start_time for x in re.findall(r"pts_time:\s*(-?[\d.]+)", proc.stderr.decode())]
+    size = w * h
+    frames = [proc.stdout[i:i + size] for i in range(0, len(proc.stdout) - size + 1, size)]
+    if not frames or len(times) != len(frames):
+        return cue.mid
+    best = max(range(len(frames)), key=lambda i: sharpness(frames[i]))
+    # Nudge just before the frame so seeking lands on it, not the one after.
+    return max(cue.start, times[best] - 0.005)
+
+
 # --- Rendering --------------------------------------------------------------
+
+# Output frames taller than this are scaled down (set from --max-height).
+MAX_HEIGHT = None
+
 
 def base_filters(deinterlace):
     filters = ["bwdif"] if deinterlace else []
     # Square the pixels so anamorphic (e.g. DVD) sources come out at display aspect.
-    filters.append("scale=trunc(iw*sar/2)*2:ih,setsar=1")
+    filters.append("scale=trunc(iw*sar/2)*2:ih:flags=lanczos,setsar=1")
+    if MAX_HEIGHT:
+        filters.append(f"scale=-2:min(ih\\,{MAX_HEIGHT}):flags=lanczos")
     return filters
 
 
 def jpeg_args(out):
-    return ["-q:v", "2"] if out.suffix.lower() in (".jpg", ".jpeg") else []
+    return ["-q:v", "3"] if out.suffix.lower() in (".jpg", ".jpeg") else []
 
 
-def render_libass(video, cue, out, sub_file, fonts_dir, start_time, deinterlace):
+def render_libass(video, t, out, sub_file, fonts_dir, start_time, deinterlace):
     sub_filter = f"subtitles=filename={escape_filter_path(sub_file)}"
     if fonts_dir:
         sub_filter += f":fontsdir={escape_filter_path(fonts_dir)}"
@@ -163,14 +209,14 @@ def render_libass(video, cue, out, sub_file, fonts_dir, start_time, deinterlace)
     # subtract the container start time so they line up with the extracted subs.
     filters = base_filters(deinterlace) + [f"setpts=PTS-{start_time}/TB", sub_filter]
     run([
-        "ffmpeg", "-v", "error", "-y", "-ss", f"{cue.mid:.3f}", "-copyts", "-i", str(video),
+        "ffmpeg", "-v", "error", "-y", "-ss", f"{t:.3f}", "-copyts", "-i", str(video),
         "-map", "0:v:0", "-vf", ",".join(filters), "-frames:v", "1", *jpeg_args(out), str(out),
     ])
 
 
-def render_bitmap(video, cue, out, track, deinterlace):
+def render_bitmap(video, cue, t, out, track, deinterlace):
     # Seek to a little before the cue starts so its subtitle packet is decoded,
-    # then drop frames up to the midpoint.
+    # then drop frames up to the chosen time.
     seek = max(0.0, cue.start - 1)
     pre = "bwdif," if deinterlace else ""
     post = ",".join(base_filters(False))
@@ -180,7 +226,7 @@ def render_bitmap(video, cue, out, track, deinterlace):
     run([
         "ffmpeg", "-v", "error", "-y", "-ss", f"{seek:.3f}", "-i", str(video),
         "-filter_complex", graph, "-map", "[out]",
-        "-ss", f"{cue.mid - seek:.3f}", "-frames:v", "1", *jpeg_args(out), str(out),
+        "-ss", f"{t - seek:.3f}", "-frames:v", "1", *jpeg_args(out), str(out),
     ])
 
 
@@ -205,16 +251,16 @@ def wrap_lines(draw, text, font, max_width):
     return lines
 
 
-def render_pillow(video, cue, out, font_path, font_scale, deinterlace):
+def render_pillow(video, cue, t, out, font_path, font_scale, deinterlace):
     from PIL import Image, ImageDraw, ImageFont
 
     png = run([
-        "ffmpeg", "-v", "error", "-ss", f"{cue.mid:.3f}", "-i", str(video),
+        "ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", str(video),
         "-map", "0:v:0", "-vf", ",".join(base_filters(deinterlace)),
         "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-",
     ]).stdout
     if not png:
-        raise RuntimeError(f"no frame at {cue.mid:.3f}s")
+        raise RuntimeError(f"no frame at {t:.3f}s")
     img = Image.open(io.BytesIO(png)).convert("RGB")
     w, h = img.size
 
@@ -227,7 +273,7 @@ def render_pillow(video, cue, out, font_path, font_scale, deinterlace):
         fill="white", stroke_width=max(2, size // 14), stroke_fill="black",
         spacing=round(size * 0.2),
     )
-    save_kwargs = {"quality": 92} if out.suffix.lower() in (".jpg", ".jpeg") else {}
+    save_kwargs = {"quality": 88} if out.suffix.lower() in (".jpg", ".jpeg") else {}
     img.save(out, **save_kwargs)
 
 
@@ -263,9 +309,14 @@ def main():
     ap.add_argument("--list-tracks", action="store_true", help="list embedded subtitle tracks and exit")
     ap.add_argument("--renderer", choices=["auto", "libass", "pillow"], default="auto",
                     help="how to draw text subs (auto: libass if ffmpeg supports it)")
-    ap.add_argument("-f", "--format", choices=["png", "jpg"], default="png")
+    ap.add_argument("-f", "--format", choices=["jpg", "png"], default="jpg")
+    ap.add_argument("--max-height", type=int, default=1080,
+                    help="scale down frames taller than this (default: 1080; 0 = never)")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="parallel ffmpeg processes")
     ap.add_argument("--deinterlace", action="store_true", help="deinterlace frames (useful for DVD rips)")
+    ap.add_argument("-w", "--window", type=float, default=0.4,
+                    help="use the sharpest frame within this many seconds of the midpoint "
+                         "(default: 0.4; 0 = exact midpoint)")
     ap.add_argument("--font", help="font file for the Pillow renderer")
     ap.add_argument("--font-scale", type=float, default=0.055,
                     help="Pillow font size as a fraction of frame height (default: 0.055)")
@@ -274,6 +325,8 @@ def main():
 
     if not args.video.exists():
         sys.exit(f"No such file: {args.video}")
+    global MAX_HEIGHT
+    MAX_HEIGHT = args.max_height
 
     probe = ffprobe_json("-show_streams", "-show_format", str(args.video))
     sub_streams = [s for s in probe["streams"] if s.get("codec_type") == "subtitle"]
@@ -331,13 +384,14 @@ def main():
             sys.exit("No subtitle cues found.")
 
         def shoot(i, cue):
-            out = out_dir / f"{i:04d}_{timestamp(cue.mid)}.{args.format}"
+            t = sharpest_frame_time(args.video, cue, args.window, start_time, args.deinterlace)
+            out = out_dir / f"{i:04d}_{timestamp(t)}.{args.format}"
             if renderer == "libass":
-                render_libass(args.video, cue, out, sub_file, fonts_dir, start_time, args.deinterlace)
+                render_libass(args.video, t, out, sub_file, fonts_dir, start_time, args.deinterlace)
             elif renderer == "bitmap":
-                render_bitmap(args.video, cue, out, args.track, args.deinterlace)
+                render_bitmap(args.video, cue, t, out, args.track, args.deinterlace)
             else:
-                render_pillow(args.video, cue, out, font_path, args.font_scale, args.deinterlace)
+                render_pillow(args.video, cue, t, out, font_path, args.font_scale, args.deinterlace)
             return out
 
         print(f"{len(cues)} cues, renderer: {renderer}, output: {out_dir}")
