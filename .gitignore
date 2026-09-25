@@ -1,0 +1,47 @@
+# Video files
+*.mp4
+*.mkv
+*.m4v
+*.mov
+*.avi
+*.wmv
+*.flv
+*.webm
+*.mpg
+*.mpeg
+*.m2ts
+*.mts
+*.ts
+*.vob
+*.iso
+
+# Subtitle files that go with the videos
+*.srt
+*.ass
+*.ssa
+*.vtt
+*.sub
+*.idx
+*.sup
+
+# Generated screenshots
+*_shots/
+shots/
+*.png
+*.jpg
+*.jpeg
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
