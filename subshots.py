@@ -174,7 +174,9 @@ def render_bitmap(video, cue, out, track, deinterlace):
     seek = max(0.0, cue.start - 1)
     pre = "bwdif," if deinterlace else ""
     post = ",".join(base_filters(False))
-    graph = f"[0:v:0]{pre}null[v];[v][0:s:{track}]overlay,{post}[out]"
+    # Rips are often cropped while the subtitle canvas keeps the original frame
+    # size (e.g. 1920x1080 PGS over a 1432x1070 pillarbox crop), so centre it.
+    graph = f"[0:v:0]{pre}null[v];[v][0:s:{track}]overlay=x=(W-w)/2:y=(H-h)/2,{post}[out]"
     run([
         "ffmpeg", "-v", "error", "-y", "-ss", f"{seek:.3f}", "-i", str(video),
         "-filter_complex", graph, "-map", "[out]",
