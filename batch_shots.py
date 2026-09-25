@@ -10,8 +10,8 @@ iplayer_shots.py's, e.g.
     output/Doctor Who (1963–1996)/Season 07/01 - Spearhead from Space, Part 1/
 
 with subtitles.srt and subtitles.csv (shot, start, end, text) alongside.
-Episodes are done in random order (--in-order for broadcast order). Finished
-episodes are skipped, so it can be stopped and re-run.
+Finished episodes are skipped, so it can be stopped and re-run (--shuffle to
+go through them in random order).
 """
 
 import argparse
@@ -140,8 +140,8 @@ def main():
     ap.add_argument("-o", "--output", type=Path, default=HERE / "output",
                     help="where screenshots go (default: ./output); copies go in its .downloads folder")
     ap.add_argument("--limit", type=int, help="only do the first N episodes")
-    ap.add_argument("--in-order", action="store_true",
-                    help="go through episodes in broadcast order (default: random order)")
+    ap.add_argument("--shuffle", action="store_true",
+                    help="go through episodes in random order (default: broadcast order)")
     ap.add_argument("--dry-run", action="store_true", help="list what would be done")
     args, subshots_args = ap.parse_known_args()
 
@@ -167,7 +167,7 @@ def main():
                 print(f"Skipping {short(dirs[id(r)])}: {why}")
     rows = [r for r in rows if r["file"] and r["has_subs"] == "yes"]
     todo = [r for r in rows if not (args.output / dirs[id(r)] / DONE_MARKER).exists()]
-    if not args.in_order:
+    if args.shuffle:
         random.shuffle(todo)
     if args.limit:
         todo = todo[: args.limit]
