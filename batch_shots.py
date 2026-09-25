@@ -62,8 +62,8 @@ def episode_dirs(rows):
 
 
 def is_animation(row):
-    """Labelled animation (not one only presumed to be, from an unlabelled file)."""
-    return row["version"].startswith("animation") and "presumed" not in row["version"]
+    """Animated stand-in for a missing episode, including unlabelled ones presumed to be."""
+    return row["version"].startswith("animation")
 
 
 def animated_only(rows):
@@ -133,8 +133,7 @@ def main():
     ap.add_argument("--csv", type=Path, default=HERE / "episodes.csv", help="from catalogue.py")
     ap.add_argument("-s", "--seasons", default="1-26", help="e.g. 7-26 or 1,3,7-9 (default: all)")
     ap.add_argument("--include-animations", action="store_true",
-                    help="also do animated stand-ins for missing episodes (skipped by default; "
-                         "unlabelled ones presumed to be animations are always included)")
+                    help="also do animated stand-ins for missing episodes (skipped by default)")
     ap.add_argument("-q", "--quiet", action="store_true", help="don't list the episodes being skipped")
     ap.add_argument("-o", "--output", type=Path, default=HERE / "output",
                     help="where screenshots go (default: ./output); copies go in its .downloads folder")
