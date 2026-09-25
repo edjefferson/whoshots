@@ -75,7 +75,7 @@ once before anything repeats. On Christmas Day it only posts Christmas episodes,
 on New Year's Day New Year's ones. State is kept in a SQLite database (`whobot.db`).
 
 ```sh
-cp deploy/whobot.env.example whobot.env && chmod 600 whobot.env   # then fill it in
+cp whobot.env.example whobot.env && chmod 600 whobot.env   # then fill it in
 .venv/bin/python whobot.py build-db output   # re-run after adding episodes; keeps post counts
 .venv/bin/python whobot.py post --dry-run
 .venv/bin/python whobot.py stats
