@@ -1,14 +1,14 @@
-# Posts one screenshot. Run by whobot.timer; copy both to /etc/systemd/system/
-# and change the paths and user to match your setup.
+# Posts one screenshot. Run hourly by whobot.timer.
+# Installed by deploy/install.sh, which fills in @DIR@ and @USER@.
 [Unit]
 Description=Post a random Doctor Who screenshot to Bluesky
 Wants=network-online.target
 After=network-online.target
 # Don't run before the disk holding the bot is mounted.
-RequiresMountsFor=/mnt/hd/whobot
+RequiresMountsFor=@DIR@
 
 [Service]
 Type=oneshot
-User=pi
+User=@USER@
 # Settings are read from whobot.env next to whobot.py.
-ExecStart=/mnt/hd/whobot/.venv/bin/python /mnt/hd/whobot/whobot.py post
+ExecStart=@DIR@/.venv/bin/python @DIR@/whobot.py post

@@ -88,11 +88,11 @@ In the URL case, `build-db` only needs the `subtitles.csv` files:
 rsync -av --include '*/' --include 'subtitles.csv' --exclude '*' output/ box:whobot/output/
 ```
 
-To post every hour, surviving reboots, install the systemd units (edit the paths and user first):
+To post every hour, surviving reboots, install the systemd timer (run it as the
+user the bot should run as; it fills in this folder's path and your username):
 
 ```sh
-sudo cp deploy/whobot.service deploy/whobot.timer /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now whobot.timer
+deploy/install.sh
 systemctl list-timers whobot.timer   # next run
 journalctl -u whobot                 # what it posted
 ```
