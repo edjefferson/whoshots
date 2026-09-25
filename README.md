@@ -27,3 +27,19 @@ motion blur.
   otherwise drawn with Pillow (`--font`, `--font-scale`).
 - **Bitmap subs** (DVD, PGS/Blu-ray, DVB) are composited with ffmpeg's `overlay`.
 - Anamorphic sources are scaled to their display aspect ratio.
+
+## Episode catalogue
+
+`catalogue.py` builds `episodes.csv`: one row per classic episode (from TVmaze),
+matched to the best file in a library laid out as `Season N/<serial>/…`.
+
+```sh
+.venv/bin/python catalogue.py "/Volumes/blobby/Doctor Who"
+```
+
+Preference order: original versions with original effects / TV editions, then
+updated effects, special editions, extended cuts and so on; for missing
+episodes, reconstructions over animations. Extras folders are ignored. Each
+row records whether the file has dialogue subtitles and which track to pass
+to `subshots.py -t`. Files that couldn't be matched are listed on stderr.
+ffprobe results are cached in `.cache/`, so re-runs are quick.

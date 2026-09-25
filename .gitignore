@@ -23,13 +23,19 @@
 *.sub
 *.idx
 *.sup
+*.ttml
 
 # Generated screenshots
 *_shots/
+output/
 shots/
 *.png
 *.jpg
 *.jpeg
+
+# Generated data
+*.csv
+.cache/
 
 # Python
 __pycache__/
@@ -45,3 +51,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Local caches and generated catalogue
+.cache/
+episodes.csv
