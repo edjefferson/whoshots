@@ -107,7 +107,8 @@ def episode_info(rel_dir):
     programme, series, folder = rel_dir.parts[-3:]
     number, title = folder.split(" - ", 1)
     series = re.sub(r"\b0+(\d)", r"\1", series)  # "Series 01" -> "Series 1"
-    return programme, series, int(number), title
+    # A recon covering several missing episodes is numbered with a range, e.g. "14-20".
+    return programme, series, int(number.split("-")[0]), title
 
 
 def build_db(db, shots_dir):
