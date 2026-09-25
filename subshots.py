@@ -277,6 +277,11 @@ def fix_ocr(line):
     line = I_WORDS.sub(lambda m: m[1].lower(), line)
     # Slashed zeros read as Q or @, e.g. "6-Q" for "6-0".
     line = re.sub(r"(?<=\d-)(Q@|Q|@|Ø)|(Q@|Q|@|Ø)(?=-\d)", "0", line)
+    # Dialogue dashes run into the next letter: "-Wwhat"/"-\What" for "-What",
+    # and "“Ves" for "-Yes".
+    line = re.sub(r"(?<=-)\\(?=[A-Z])", "", line)
+    line = re.sub(r"\bWw(?=[a-z])", "W", line)
+    line = re.sub(r"^[“”\"]V(?=es\b)", "-Y", line)
     return line
 
 
