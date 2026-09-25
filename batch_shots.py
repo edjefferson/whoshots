@@ -61,6 +61,11 @@ def episode_dirs(rows):
     return dirs
 
 
+def is_animation(row):
+    """Labelled animation (not one only presumed to be, from an unlabelled file)."""
+    return row["version"].startswith("animation") and "presumed" not in row["version"]
+
+
 def animated_only(rows):
     """Stories whose only available versions are animations."""
     stories = {}
@@ -127,6 +132,9 @@ def main():
     ap.add_argument("root", type=Path, help="library folder the CSV's paths are relative to")
     ap.add_argument("--csv", type=Path, default=HERE / "episodes.csv", help="from catalogue.py")
     ap.add_argument("-s", "--seasons", default="1-26", help="e.g. 7-26 or 1,3,7-9 (default: all)")
+    ap.add_argument("--include-animations", action="store_true",
+                    help="also do animated stand-ins for missing episodes (skipped by default; "
+                         "unlabelled ones presumed to be animations are always included)")
     ap.add_argument("-q", "--quiet", action="store_true", help="don't list the episodes being skipped")
     ap.add_argument("-o", "--output", type=Path, default=HERE / "output",
                     help="where screenshots go (default: ./output); copies go in its .downloads folder")
@@ -144,6 +152,11 @@ def main():
         if int(story[0]) in seasons:
             print(f"Skipping {story[1]}: only animated versions available")
     rows = [r for r in rows if (r["season"], r["serial"]) not in animated]
+    if not args.include_animations:
+        for r in rows:
+            if is_animation(r):
+                print(f"Skipping {short(dirs[id(r)])}: animation")
+        rows = [r for r in rows if not is_animation(r)]
     for r in rows:
         if not r["file"] or r["has_subs"] != "yes":
             why = "no file" if not r["file"] else "no subtitles"
