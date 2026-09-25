@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Post a random Doctor Who screenshot to Bluesky.
 
-    whobot.py build-db [SHOTS_DIR]   load/refresh shots from SHOTS_DIR/**/subtitles.csv
+    whobot.py build-db [SHOTS_DIR]   load new/changed shots from SHOTS_DIR/**/subtitles.csv
     whobot.py post [--dry-run]       post the next shot (run hourly by a systemd timer)
     whobot.py stats                  how far through the shots it's got
 
@@ -77,6 +77,12 @@ CREATE TABLE IF NOT EXISTS shots (
 );
 CREATE INDEX IF NOT EXISTS shots_pick ON shots (skip, tag, post_count);
 CREATE INDEX IF NOT EXISTS shots_dir ON shots (dir);
+-- Each episode's subtitles.csv as last loaded, so unchanged ones can be skipped.
+CREATE TABLE IF NOT EXISTS episodes (
+    dir TEXT PRIMARY KEY,
+    csv_mtime REAL NOT NULL,
+    csv_size INTEGER NOT NULL
+);
 """
 
 
@@ -114,41 +120,69 @@ def episode_info(rel_dir):
     return programme, series, int(number.split("-")[0]), title
 
 
-def build_db(db, shots_dir):
+def subdirs(path):
+    return sorted(e.path for e in os.scandir(path) if e.is_dir() and not e.name.startswith("."))
+
+
+def find_episodes(shots_dir):
+    """(csv path, stat) for each <programme>/<series>/<episode>/subtitles.csv.
+
+    Walks only the folder levels, so the (many) images in episode folders are
+    never listed, which matters on a slow disk.
+    """
+    found = []
+    for programme in subdirs(shots_dir):
+        for series in subdirs(programme):
+            for episode in subdirs(series):
+                path = Path(episode, "subtitles.csv")
+                try:
+                    found.append((path, path.stat()))
+                except FileNotFoundError:
+                    pass  # not finished yet
+    return found
+
+
+def status_line(text):
+    width = shutil.get_terminal_size().columns
+    sys.stdout.write("\r\033[K" + (text if len(text) < width else text[: width - 2] + "…"))
+    sys.stdout.flush()
+
+
+def build_db(db, shots_dir, full=False):
     started = time.monotonic()
     print(f"Looking for episodes in {shots_dir}...", flush=True)
-    csvs = sorted(shots_dir.glob("**/subtitles.csv"))
-    if not csvs:
+    found = find_episodes(shots_dir)
+    if not found:
         sys.exit(f"No subtitles.csv files under {shots_dir}")
-    tag_of = {title: tag for tag, titles in TAGS.items() for title in titles}
+    loaded = {d: (m, s) for d, m, s in db.execute("SELECT dir, csv_mtime, csv_size FROM episodes")}
+    todo = [(p, st) for p, st in found
+            if full or loaded.get(p.parent.relative_to(shots_dir).as_posix()) != (st.st_mtime, st.st_size)]
+    print(f"Found {len(found)} episodes, {len(todo)} new or changed.", flush=True)
+
     before = db.execute("SELECT count(*) FROM shots").fetchone()[0]
     known_dirs = {d for (d,) in db.execute("SELECT DISTINCT dir FROM shots")}
     new_episodes = removed = 0
     tty = sys.stdout.isatty()
-    print(f"Found {len(csvs)} episodes; loading...", flush=True)
     with db:
-        for i, path in enumerate(csvs, 1):
+        for i, (path, st) in enumerate(todo, 1):
             rel_dir = path.parent.relative_to(shots_dir)
             if tty:
-                line = f"[{i}/{len(csvs)}] {Path(*rel_dir.parts[1:])}"
-                width = shutil.get_terminal_size().columns
-                sys.stdout.write("\r\033[K" + (line if len(line) < width else line[: width - 2] + "…"))
-                sys.stdout.flush()
+                status_line(f"[{i}/{len(todo)}] {Path(*rel_dir.parts[1:])}")
             new_episodes += rel_dir.as_posix() not in known_dirs
             programme, series, number, title = episode_info(rel_dir)
             with open(path, newline="", encoding="utf-8") as f:
                 rows = [r for r in csv.DictReader(f) if r["shot"]]
             shot_paths = [(rel_dir / r["shot"]).as_posix() for r in rows]
             db.executemany("""
-                INSERT INTO shots (path, dir, programme, series, episode, title, start, end, text, tag)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO shots (path, dir, programme, series, episode, title, start, end, text)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path) DO UPDATE SET
                     dir = excluded.dir, programme = excluded.programme, series = excluded.series,
                     episode = excluded.episode, title = excluded.title, start = excluded.start,
-                    end = excluded.end, text = excluded.text, tag = excluded.tag
+                    end = excluded.end, text = excluded.text
             """, [
                 (p, rel_dir.as_posix(), programme, series, number, title,
-                 float(r["start"]), float(r["end"]), r["text"], tag_of.get(title))
+                 float(r["start"]), float(r["end"]), r["text"])
                 for p, r in zip(shot_paths, rows)
             ])
             # Shots this episode's CSV no longer lists (e.g. it was redone).
@@ -156,6 +190,13 @@ def build_db(db, shots_dir):
                 f"DELETE FROM shots WHERE dir = ? AND path NOT IN ({','.join('?' * len(shot_paths))})",
                 [rel_dir.as_posix(), *shot_paths],
             ).rowcount
+            db.execute("INSERT OR REPLACE INTO episodes (dir, csv_mtime, csv_size) VALUES (?, ?, ?)",
+                       (rel_dir.as_posix(), st.st_mtime, st.st_size))
+        # Tags are applied to every episode each time, so editing TAGS takes effect without --full.
+        db.execute("UPDATE shots SET tag = NULL WHERE tag IS NOT NULL")
+        for tag, titles in TAGS.items():
+            db.execute(f"UPDATE shots SET tag = ? WHERE title IN ({','.join('?' * len(titles))})",
+                       [tag, *titles])
     if tty:
         sys.stdout.write("\r\033[K")
     total = db.execute("SELECT count(*) FROM shots").fetchone()[0]
@@ -166,8 +207,8 @@ def build_db(db, shots_dir):
         "SELECT programme, count(DISTINCT dir), count(*) FROM shots GROUP BY programme ORDER BY programme"
     ):
         print(f"  {programme}: {episodes} episodes, {shots} shots")
-    missing = [t for titles in TAGS.values() for t in titles
-               if not db.execute("SELECT 1 FROM shots WHERE title = ?", (t,)).fetchone()]
+    tagged = {t for (t,) in db.execute("SELECT DISTINCT title FROM shots WHERE tag IS NOT NULL")}
+    missing = [t for titles in TAGS.values() for t in titles if t not in tagged]
     if missing:
         print(f"Tagged episodes not in the database yet: {', '.join(sorted(missing))}")
 
@@ -257,6 +298,7 @@ def main():
     sub = ap.add_subparsers(dest="command", required=True)
     b = sub.add_parser("build-db", help="load/refresh shots from subtitles.csv files")
     b.add_argument("shots_dir", type=Path, nargs="?", help="folder of episode folders (default: IMAGES_DIR)")
+    b.add_argument("--full", action="store_true", help="reload every episode, not just new or changed ones")
     p = sub.add_parser("post", help="post the next shot")
     p.add_argument("--dry-run", action="store_true", help="show what would be posted, without posting")
     p.add_argument("--date", type=datetime.date.fromisoformat, default=None, help=argparse.SUPPRESS)
@@ -266,7 +308,7 @@ def main():
     load_env()
     db = connect()
     if args.command == "build-db":
-        build_db(db, args.shots_dir or Path(os.environ["IMAGES_DIR"]))
+        build_db(db, args.shots_dir or Path(os.environ["IMAGES_DIR"]), args.full)
     elif args.command == "post":
         post(db, args.dry_run, args.date or datetime.date.today())
     else:
