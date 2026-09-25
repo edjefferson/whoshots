@@ -169,6 +169,8 @@ def main():
     todo = [r for r in rows if not (args.output / dirs[id(r)] / DONE_MARKER).exists()]
     if args.shuffle:
         random.shuffle(todo)
+        # Episodes an interrupted run started go first, so they get finished.
+        todo.sort(key=lambda r: not (args.output / dirs[id(r)]).exists())
     if args.limit:
         todo = todo[: args.limit]
     if len(todo) < len(rows):
