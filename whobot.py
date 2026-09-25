@@ -26,8 +26,10 @@ import datetime
 import io
 import os
 import re
+import shutil
 import sqlite3
 import sys
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -74,6 +76,7 @@ CREATE TABLE IF NOT EXISTS shots (
     post_uri TEXT
 );
 CREATE INDEX IF NOT EXISTS shots_pick ON shots (skip, tag, post_count);
+CREATE INDEX IF NOT EXISTS shots_dir ON shots (dir);
 """
 
 
@@ -112,14 +115,26 @@ def episode_info(rel_dir):
 
 
 def build_db(db, shots_dir):
+    started = time.monotonic()
+    print(f"Looking for episodes in {shots_dir}...", flush=True)
     csvs = sorted(shots_dir.glob("**/subtitles.csv"))
     if not csvs:
         sys.exit(f"No subtitles.csv files under {shots_dir}")
     tag_of = {title: tag for tag, titles in TAGS.items() for title in titles}
     before = db.execute("SELECT count(*) FROM shots").fetchone()[0]
+    known_dirs = {d for (d,) in db.execute("SELECT DISTINCT dir FROM shots")}
+    new_episodes = removed = 0
+    tty = sys.stdout.isatty()
+    print(f"Found {len(csvs)} episodes; loading...", flush=True)
     with db:
-        for path in csvs:
+        for i, path in enumerate(csvs, 1):
             rel_dir = path.parent.relative_to(shots_dir)
+            if tty:
+                line = f"[{i}/{len(csvs)}] {Path(*rel_dir.parts[1:])}"
+                width = shutil.get_terminal_size().columns
+                sys.stdout.write("\r\033[K" + (line if len(line) < width else line[: width - 2] + "…"))
+                sys.stdout.flush()
+            new_episodes += rel_dir.as_posix() not in known_dirs
             programme, series, number, title = episode_info(rel_dir)
             with open(path, newline="", encoding="utf-8") as f:
                 rows = [r for r in csv.DictReader(f) if r["shot"]]
@@ -137,12 +152,20 @@ def build_db(db, shots_dir):
                 for p, r in zip(shot_paths, rows)
             ])
             # Shots this episode's CSV no longer lists (e.g. it was redone).
-            db.execute(
+            removed += db.execute(
                 f"DELETE FROM shots WHERE dir = ? AND path NOT IN ({','.join('?' * len(shot_paths))})",
                 [rel_dir.as_posix(), *shot_paths],
-            )
-    added = db.execute("SELECT count(*) FROM shots").fetchone()[0] - before
-    print(f"{len(csvs)} episodes, {added:+d} shots, {before + added} in total")
+            ).rowcount
+    if tty:
+        sys.stdout.write("\r\033[K")
+    total = db.execute("SELECT count(*) FROM shots").fetchone()[0]
+    added = total - before + removed
+    print(f"Done in {time.monotonic() - started:.1f}s: {new_episodes} new episode(s), "
+          f"{added} new shot(s), {removed} removed, {total} in total")
+    for programme, episodes, shots in db.execute(
+        "SELECT programme, count(DISTINCT dir), count(*) FROM shots GROUP BY programme ORDER BY programme"
+    ):
+        print(f"  {programme}: {episodes} episodes, {shots} shots")
     missing = [t for titles in TAGS.values() for t in titles
                if not db.execute("SELECT 1 FROM shots WHERE title = ?", (t,)).fetchone()]
     if missing:
