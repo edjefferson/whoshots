@@ -16,7 +16,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 Screenshots are JPEGs named `NNNN_HH-MM-SS.mmm.jpg` (cue number and frame time),
-scaled down to at most 1080px tall (`--max-height`, `-f png` for lossless).
+scaled down to at most 576px tall (DVD height) (`--max-height`, `-f png` for lossless).
 
 Rather than the exact midpoint of each cue, the sharpest frame within ±0.4s of
 it is used (`-w/--window`, `-w 0` for the exact midpoint), which avoids a lot of

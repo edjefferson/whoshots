@@ -310,8 +310,8 @@ def main():
     ap.add_argument("--renderer", choices=["auto", "libass", "pillow"], default="auto",
                     help="how to draw text subs (auto: libass if ffmpeg supports it)")
     ap.add_argument("-f", "--format", choices=["jpg", "png"], default="jpg")
-    ap.add_argument("--max-height", type=int, default=1080,
-                    help="scale down frames taller than this (default: 1080; 0 = never)")
+    ap.add_argument("--max-height", type=int, default=576,
+                    help="scale down frames taller than this (default: 576, DVD height; 0 = never)")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4, help="parallel ffmpeg processes")
     ap.add_argument("--deinterlace", action="store_true", help="deinterlace frames (useful for DVD rips)")
     ap.add_argument("-w", "--window", type=float, default=0.4,
