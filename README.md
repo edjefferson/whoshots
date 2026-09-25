@@ -56,3 +56,43 @@ copying while the current one is screenshotted. Re-run to resume.
 .venv/bin/python batch_shots.py "/Volumes/blobby/Doctor Who" -s 7-26 --dry-run
 .venv/bin/python batch_shots.py "/Volumes/blobby/Doctor Who" -s 7-26
 ```
+
+## iPlayer episodes
+
+```sh
+python3 iplayer_urls.py                         # episode list -> iplayer_episodes.csv
+caffeinate -i .venv/bin/python iplayer_shots.py # download + screenshot everything -> output/
+```
+
+Each episode folder gets its screenshots plus `subtitles.srt` and `subtitles.csv`
+(shot, start, end, text). Videos are deleted once screenshotted; re-running skips
+finished episodes.
+
+## Bluesky bot
+
+`whobot.py` posts a random screenshot, least-posted first, so everything gets posted
+once before anything repeats. On Christmas Day it only posts Christmas episodes, and
+on New Year's Day New Year's ones. State is kept in a SQLite database (`whobot.db`).
+
+```sh
+cp deploy/whobot.env.example whobot.env && chmod 600 whobot.env   # then fill it in
+.venv/bin/python whobot.py build-db output   # re-run after adding episodes; keeps post counts
+.venv/bin/python whobot.py post --dry-run
+.venv/bin/python whobot.py stats
+```
+
+The images can be in a local folder (`IMAGES_DIR`) or on a web server (`IMAGES_URL`).
+In the URL case, `build-db` only needs the `subtitles.csv` files:
+
+```sh
+rsync -av --include '*/' --include 'subtitles.csv' --exclude '*' output/ box:whobot/output/
+```
+
+To post every hour, surviving reboots, install the systemd units (edit the paths and user first):
+
+```sh
+sudo cp deploy/whobot.service deploy/whobot.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now whobot.timer
+systemctl list-timers whobot.timer   # next run
+journalctl -u whobot                 # what it posted
+```

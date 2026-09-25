@@ -250,18 +250,34 @@ def ocr_subtitle(image_path):
     bbox = img.getchannel("A").getbbox()
     if not bbox:
         return ""
-    # White text on black, inverted to black on white and scaled up, reads best.
+    # Scale to the size of a 1620px-tall subtitle canvas (about 2.8x for DVD,
+    # 1.5x for Blu-ray): small DVD text needs enlarging, but enlarging Blu-ray
+    # text much more than this makes tesseract misread "i" as "I".
+    scale = 1620 / img.height
+    # White text on black, inverted to black on white, reads best.
     img = img.crop(bbox)
     flat = Image.new("RGB", img.size, (0, 0, 0))
     flat.paste(img, mask=img.getchannel("A"))
-    flat = ImageOps.invert(flat).resize((img.width * 3, img.height * 3), Image.LANCZOS)
+    flat = ImageOps.invert(flat).resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
     flat = ImageOps.expand(flat, 30, fill=(255, 255, 255))
     buf = io.BytesIO()
     flat.save(buf, "PNG")
     text = run(["tesseract", "stdin", "stdout", "--psm", "6", "-l", "eng"], input=buf.getvalue()).stdout
     lines = [line.strip() for line in text.decode(errors="replace").splitlines() if line.strip()]
-    # A lone "|" is almost always a misread "I".
-    return "\n".join(re.sub(r"(?<![\w|])\|(?![\w|])", "I", line) for line in lines)
+    return "\n".join(fix_ocr(line) for line in lines)
+
+
+# Words tesseract capitalises by misreading "i" as "I"; never capitalised mid-sentence.
+I_WORDS = re.compile(r"(?<=[a-z,] )(Is|It|It's|Its|In|If|Into)\b")
+
+
+def fix_ocr(line):
+    """Correct tesseract's usual mistakes on subtitle fonts."""
+    line = re.sub(r"(?<![\w|])\|(?![\w|])", "I", line)  # a lone "|" is a misread "I"
+    line = I_WORDS.sub(lambda m: m[1].lower(), line)
+    # Slashed zeros read as Q or @, e.g. "6-Q" for "6-0".
+    line = re.sub(r"(?<=\d-)(Q@|Q|@|Ø)|(Q@|Q|@|Ø)(?=-\d)", "0", line)
+    return line
 
 
 def save_subtitles(out_dir, results):

@@ -1,0 +1,11 @@
+[Unit]
+Description=Post a Doctor Who screenshot every hour
+
+[Timer]
+OnCalendar=hourly
+# If the machine was off on the hour, post once when it's back (not once per missed hour).
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

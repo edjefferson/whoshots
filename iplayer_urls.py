@@ -2,7 +2,8 @@
 """List the iPlayer episode URLs for Doctor Who (2005-2022) and Doctor Who (2023-).
 
 Reads the Redux state embedded in each iPlayer "episodes" page, walking every
-series slice and page. Writes a CSV of url, pid, programme and episode subtitle.
+series slice and page. Writes a CSV of url, pid, programme, series (the iPlayer
+series tab it is listed under) and episode subtitle.
 """
 
 import csv
@@ -41,7 +42,7 @@ def brand_episodes(brand_url):
             for item in state["entities"]["results"]:
                 ep = item.get("episode")
                 if ep:
-                    yield ep["id"], ep["title"]["default"], ep["subtitle"]["default"]
+                    yield ep["id"], ep["title"]["default"], sl["title"], ep["subtitle"]["default"]
             if page >= state["pagination"]["totalPages"]:
                 break
             page += 1
@@ -53,13 +54,13 @@ def main():
     seen = set()
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["url", "pid", "programme", "episode"])
+        writer.writerow(["url", "pid", "programme", "series", "episode"])
         for brand in BRANDS:
-            for pid, title, subtitle in brand_episodes(brand):
+            for pid, title, series, subtitle in brand_episodes(brand):
                 if pid in seen:
                     continue
                 seen.add(pid)
-                writer.writerow([f"https://www.bbc.co.uk/iplayer/episode/{pid}", pid, title, subtitle])
+                writer.writerow([f"https://www.bbc.co.uk/iplayer/episode/{pid}", pid, title, series, subtitle])
     print(f"{len(seen)} episodes -> {path}", file=sys.stderr)
 
 
