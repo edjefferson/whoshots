@@ -34,7 +34,7 @@ motion blur.
 matched to the best file in a library laid out as `Season N/<serial>/…`.
 
 ```sh
-.venv/bin/python catalogue.py "/Volumes/blobby/Doctor Who"
+.venv/bin/python catalogue.py [location]"
 ```
 
 Preference order: original versions with original effects / TV editions, then
