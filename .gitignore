@@ -55,3 +55,6 @@ Thumbs.db
 # Local caches and generated catalogue
 .cache/
 episodes.csv
+
+# Archives
+*.zip

@@ -13,10 +13,12 @@ Bitmap subtitles are composited with ffmpeg's `overlay` filter.
 """
 
 import argparse
+import csv
 import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -214,20 +216,72 @@ def render_libass(video, t, out, sub_file, fonts_dir, start_time, deinterlace):
     ])
 
 
-def render_bitmap(video, cue, t, out, track, deinterlace):
+def render_bitmap(video, cue, t, out, track, deinterlace, sub_image=None):
+    """Screenshot with the bitmap subtitle overlaid; optionally also save the
+    subtitle on its own (transparent background) to sub_image, for OCR."""
     # Seek to a little before the cue starts so its subtitle packet is decoded,
     # then drop frames up to the chosen time.
     seek = max(0.0, cue.start - 1)
     pre = "bwdif," if deinterlace else ""
     post = ",".join(base_filters(False))
+    subs = f"[0:s:{track}]"
+    graph = f"[0:v:0]{pre}null[v];"
+    if sub_image:
+        graph += f"{subs}split[s1][s2];[s2]format=rgba[subimg];"
+        subs = "[s1]"
     # Rips are often cropped while the subtitle canvas keeps the original frame
     # size (e.g. 1920x1080 PGS over a 1432x1070 pillarbox crop), so centre it.
-    graph = f"[0:v:0]{pre}null[v];[v][0:s:{track}]overlay=x=(W-w)/2:y=(H-h)/2,{post}[out]"
-    run([
+    graph += f"[v]{subs}overlay=x=(W-w)/2:y=(H-h)/2,{post}[out]"
+    cmd = [
         "ffmpeg", "-v", "error", "-y", "-ss", f"{seek:.3f}", "-i", str(video),
         "-filter_complex", graph, "-map", "[out]",
         "-ss", f"{t - seek:.3f}", "-frames:v", "1", *jpeg_args(out), str(out),
-    ])
+    ]
+    if sub_image:
+        cmd += ["-map", "[subimg]", "-ss", f"{t - seek:.3f}", "-frames:v", "1", str(sub_image)]
+    run(cmd)
+
+
+def ocr_subtitle(image_path):
+    """Read the text of a bitmap subtitle with tesseract."""
+    from PIL import Image, ImageOps
+
+    img = Image.open(image_path).convert("RGBA")
+    bbox = img.getchannel("A").getbbox()
+    if not bbox:
+        return ""
+    # White text on black, inverted to black on white and scaled up, reads best.
+    img = img.crop(bbox)
+    flat = Image.new("RGB", img.size, (0, 0, 0))
+    flat.paste(img, mask=img.getchannel("A"))
+    flat = ImageOps.invert(flat).resize((img.width * 3, img.height * 3), Image.LANCZOS)
+    flat = ImageOps.expand(flat, 30, fill=(255, 255, 255))
+    buf = io.BytesIO()
+    flat.save(buf, "PNG")
+    text = run(["tesseract", "stdin", "stdout", "--psm", "6", "-l", "eng"], input=buf.getvalue()).stdout
+    lines = [line.strip() for line in text.decode(errors="replace").splitlines() if line.strip()]
+    # A lone "|" is almost always a misread "I".
+    return "\n".join(re.sub(r"(?<![\w|])\|(?![\w|])", "I", line) for line in lines)
+
+
+def save_subtitles(out_dir, results):
+    """Write subtitles.srt, and subtitles.csv saying which line each shot shows.
+
+    results: (cue, shot filename or None, text) in cue order.
+    """
+    import pysubs2
+
+    srt = pysubs2.SSAFile()
+    for cue, _, text in results:
+        if text:
+            srt.events.append(pysubs2.SSAEvent(
+                start=round(cue.start * 1000), end=round(cue.end * 1000), text=text.replace("\n", "\\N")))
+    srt.save(str(out_dir / "subtitles.srt"))
+    with open(out_dir / "subtitles.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["shot", "start", "end", "text"])
+        for cue, shot, text in results:
+            writer.writerow([shot or "", f"{cue.start:.3f}", f"{cue.end:.3f}", text])
 
 
 def find_font(explicit):
@@ -321,6 +375,9 @@ def main():
     ap.add_argument("--font-scale", type=float, default=0.055,
                     help="Pillow font size as a fraction of frame height (default: 0.055)")
     ap.add_argument("--limit", type=int, help="only do the first N cues")
+    ap.add_argument("--save-subs", action="store_true",
+                    help="also write subtitles.srt and subtitles.csv (shot, start, end, text) to the "
+                         "output folder; bitmap subtitles are read with tesseract OCR")
     args = ap.parse_args()
 
     if not args.video.exists():
@@ -383,30 +440,42 @@ def main():
         if not cues:
             sys.exit("No subtitle cues found.")
 
+        if args.save_subs and renderer == "bitmap" and not shutil.which("tesseract"):
+            sys.exit("--save-subs needs tesseract to read bitmap subtitles (brew install tesseract).")
+
         def shoot(i, cue):
+            """Take the screenshot; return the subtitle's text."""
             t = sharpest_frame_time(args.video, cue, args.window, start_time, args.deinterlace)
             out = out_dir / f"{i:04d}_{timestamp(t)}.{args.format}"
             if renderer == "libass":
                 render_libass(args.video, t, out, sub_file, fonts_dir, start_time, args.deinterlace)
             elif renderer == "bitmap":
-                render_bitmap(args.video, cue, t, out, args.track, args.deinterlace)
+                sub_image = tmp / f"sub{i:04d}.png" if args.save_subs else None
+                render_bitmap(args.video, cue, t, out, args.track, args.deinterlace, sub_image)
+                if sub_image:
+                    text = ocr_subtitle(sub_image)
+                    sub_image.unlink()
+                    return out.name, text
             else:
                 render_pillow(args.video, cue, t, out, font_path, args.font_scale, args.deinterlace)
-            return out
+            return out.name, cue.text
 
         print(f"{len(cues)} cues, renderer: {renderer}, output: {out_dir}")
         failures = 0
+        results = {}
         with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
             futures = {pool.submit(shoot, i, c): (i, c) for i, c in enumerate(cues, 1)}
             for done, fut in enumerate(as_completed(futures), 1):
                 i, cue = futures[fut]
                 try:
-                    fut.result()
+                    results[i] = fut.result()
                 except Exception as e:
                     failures += 1
                     print(f"\n  cue {i} @ {timestamp(cue.mid)} failed: {e}", file=sys.stderr)
                 print(f"\r  {done}/{len(cues)}", end="", flush=True)
         print()
+        if args.save_subs:
+            save_subtitles(out_dir, [(c, *results.get(i, (None, c.text))) for i, c in enumerate(cues, 1)])
         if failures:
             sys.exit(f"{failures} screenshot(s) failed.")
 

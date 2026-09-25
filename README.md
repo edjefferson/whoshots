@@ -43,3 +43,16 @@ episodes, reconstructions over animations. Extras folders are ignored. Each
 row records whether the file has dialogue subtitles and which track to pass
 to `subshots.py -t`. Files that couldn't be matched are listed on stderr.
 ffprobe results are cached in `.cache/`, so re-runs are quick.
+
+## Batch screenshots of the classic series
+
+`batch_shots.py` runs `subshots.py --save-subs` over the episodes in
+`episodes.csv`, into `output/Doctor Who (1963–1996)/Season NN/NN - Serial, Part N/`
+alongside `subtitles.srt` and `subtitles.csv` (bitmap DVD/Blu-ray subtitles
+are read with tesseract OCR). Each file is copied locally first, with the next
+copying while the current one is screenshotted. Re-run to resume.
+
+```sh
+.venv/bin/python batch_shots.py "/Volumes/blobby/Doctor Who" -s 7-26 --dry-run
+.venv/bin/python batch_shots.py "/Volumes/blobby/Doctor Who" -s 7-26
+```
