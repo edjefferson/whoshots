@@ -144,6 +144,9 @@ def main():
                     help="go through episodes in random order (default: broadcast order)")
     ap.add_argument("--dry-run", action="store_true", help="list what would be done")
     args, subshots_args = ap.parse_known_args()
+    # Check options meant for subshots.py now, rather than failing on every episode.
+    from subshots import build_parser
+    build_parser().parse_args([*subshots_args, "video"])
 
     with open(args.csv, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))

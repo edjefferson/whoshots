@@ -171,7 +171,7 @@ def sharpest_frame_time(video, cue, window, start_time, deinterlace):
     filters = (["bwdif"] if deinterlace else []) + [f"scale={w}:{h}", "format=gray", "showinfo"]
     proc = run([
         "ffmpeg", "-hide_banner", "-ss", f"{lo:.3f}", "-t", f"{hi - lo:.3f}", "-copyts",
-        "-i", str(video), "-map", "0:v:0", "-vf", ",".join(filters),
+        *HWACCEL, "-i", str(video), "-map", "0:v:0", "-vf", ",".join(filters),
         "-f", "rawvideo", "-",
     ])
     times = [float(x) - start_time for x in re.findall(r"pts_time:\s*(-?[\d.]+)", proc.stderr.decode())]
@@ -188,6 +188,9 @@ def sharpest_frame_time(video, cue, window, start_time, deinterlace):
 
 # Output frames taller than this are scaled down (set from --max-height).
 MAX_HEIGHT = None
+# ffmpeg input options for hardware video decoding (set from --hwaccel). ffmpeg
+# falls back to software decoding for codecs the hardware can't handle.
+HWACCEL = []
 
 
 def base_filters(deinterlace):
@@ -211,7 +214,7 @@ def render_libass(video, t, out, sub_file, fonts_dir, start_time, deinterlace):
     # subtract the container start time so they line up with the extracted subs.
     filters = base_filters(deinterlace) + [f"setpts=PTS-{start_time}/TB", sub_filter]
     run([
-        "ffmpeg", "-v", "error", "-y", "-ss", f"{t:.3f}", "-copyts", "-i", str(video),
+        "ffmpeg", "-v", "error", "-y", "-ss", f"{t:.3f}", "-copyts", *HWACCEL, "-i", str(video),
         "-map", "0:v:0", "-vf", ",".join(filters), "-frames:v", "1", *jpeg_args(out), str(out),
     ])
 
@@ -233,7 +236,7 @@ def render_bitmap(video, cue, t, out, track, deinterlace, sub_image=None):
     # size (e.g. 1920x1080 PGS over a 1432x1070 pillarbox crop), so centre it.
     graph += f"[v]{subs}overlay=x=(W-w)/2:y=(H-h)/2,{post}[out]"
     cmd = [
-        "ffmpeg", "-v", "error", "-y", "-ss", f"{seek:.3f}", "-i", str(video),
+        "ffmpeg", "-v", "error", "-y", "-ss", f"{seek:.3f}", *HWACCEL, "-i", str(video),
         "-filter_complex", graph, "-map", "[out]",
         "-ss", f"{t - seek:.3f}", "-frames:v", "1", *jpeg_args(out), str(out),
     ]
@@ -262,7 +265,9 @@ def ocr_subtitle(image_path):
     flat = ImageOps.expand(flat, 30, fill=(255, 255, 255))
     buf = io.BytesIO()
     flat.save(buf, "PNG")
-    text = run(["tesseract", "stdin", "stdout", "--psm", "6", "-l", "eng"], input=buf.getvalue()).stdout
+    # One thread per tesseract: several run at once, and their threads would compete.
+    text = run(["tesseract", "stdin", "stdout", "--psm", "6", "-l", "eng"], input=buf.getvalue(),
+               env={**os.environ, "OMP_THREAD_LIMIT": "1"}).stdout
     lines = [line.strip() for line in text.decode(errors="replace").splitlines() if line.strip()]
     return "\n".join(fix_ocr(line) for line in lines)
 
@@ -330,7 +335,7 @@ def render_pillow(video, cue, t, out, font_path, font_scale, deinterlace):
     from PIL import Image, ImageDraw, ImageFont
 
     png = run([
-        "ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", str(video),
+        "ffmpeg", "-v", "error", "-ss", f"{t:.3f}", *HWACCEL, "-i", str(video),
         "-map", "0:v:0", "-vf", ",".join(base_filters(deinterlace)),
         "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-",
     ]).stdout
@@ -375,7 +380,7 @@ def dump_attachments(video, dest):
     return dest if any(dest.iterdir()) else None
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("video", type=Path)
     ap.add_argument("-o", "--output", type=Path, help="output directory (default: <video name>_shots)")
@@ -396,10 +401,17 @@ def main():
     ap.add_argument("--font-scale", type=float, default=0.055,
                     help="Pillow font size as a fraction of frame height (default: 0.055)")
     ap.add_argument("--limit", type=int, help="only do the first N cues")
+    ap.add_argument("--hwaccel", default="auto",
+                    help="ffmpeg hardware decoder, e.g. videotoolbox, or 'none' "
+                         "(default: auto = videotoolbox for HEVC video on macOS)")
     ap.add_argument("--save-subs", action="store_true",
                     help="also write subtitles.srt and subtitles.csv (shot, start, end, text) to the "
                          "output folder; bitmap subtitles are read with tesseract OCR")
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
 
     if not args.video.exists():
         sys.exit(f"No such file: {args.video}")
@@ -411,8 +423,17 @@ def main():
     if args.list_tracks:
         list_tracks(sub_streams)
         return
-    if not any(s.get("codec_type") == "video" for s in probe["streams"]):
+    video_stream = next((s for s in probe["streams"] if s.get("codec_type") == "video"), None)
+    if not video_stream:
         sys.exit("No video stream found.")
+    global HWACCEL
+    hwaccel = args.hwaccel
+    if hwaccel == "auto":
+        # Hardware decoding pays off for HEVC, which is slow to decode in software;
+        # for H.264 (e.g. iPlayer) starting the decoder costs more than it saves.
+        hevc = video_stream.get("codec_name") == "hevc"
+        hwaccel = "videotoolbox" if sys.platform == "darwin" and hevc else "none"
+    HWACCEL = [] if hwaccel == "none" else ["-hwaccel", hwaccel]
     start_time = float(probe["format"].get("start_time", 0) or 0)
 
     out_dir = args.output or args.video.with_name(f"{args.video.stem}_shots")
