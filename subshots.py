@@ -160,10 +160,12 @@ def sharpness(gray_bytes):
 def window_bounds(cue, window):
     """(start, end) of the frames to choose from around the cue's midpoint, or
     None to just use the frame at the midpoint. Stays inside the cue so the
-    subtitle is still showing."""
+    subtitle is still showing. A very short cue (a subtitle flashed up for a
+    frame or two) leaves a window too small to hold a frame, so that uses the
+    midpoint too."""
     lo = max(cue.start + 0.05, cue.mid - window)
     hi = min(cue.end - 0.05, cue.mid + window)
-    return (lo, hi) if window > 0 and hi > lo else None
+    return (lo, hi) if window > 0 and hi - lo >= 0.1 else None
 
 
 def grab_sharpest(video, cue, window, deinterlace, workdir, track=None, sub_image=None):
