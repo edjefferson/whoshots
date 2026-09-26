@@ -562,12 +562,16 @@ def main():
             if not bitmap:
                 draw_subtitle(img, cue.text, font_path, args.font_scale)
             out = out_dir / f"{i:04d}_{timestamp(t)}.{args.format}"
-            save_image(img, out)
             if sub_image:
                 prepared = tmp / f"ocr{i:04d}.png"
                 has_text = prepare_for_ocr(sub_image, prepared)
                 sub_image.unlink()
-                return out.name, prepared if has_text else ""
+                if not has_text:
+                    # A subtitle with nothing visible (a glitch on some discs): no screenshot.
+                    return None, ""
+                save_image(img, out)
+                return out.name, prepared
+            save_image(img, out)
             return out.name, cue.text
 
         print(f"{len(cues)} cues, renderer: {renderer}, output: {out_dir}")
