@@ -100,6 +100,8 @@ CREATE TABLE IF NOT EXISTS shots (
 );
 CREATE INDEX IF NOT EXISTS shots_pick ON shots (skip, tag, post_count);
 CREATE INDEX IF NOT EXISTS shots_dir ON shots (dir);
+-- Small things to remember between runs, e.g. the tag list last applied.
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 -- Each episode's subtitles.csv as last loaded, so unchanged ones can be skipped.
 CREATE TABLE IF NOT EXISTS episodes (
     dir TEXT PRIMARY KEY,
@@ -126,8 +128,13 @@ def load_env():
 
 
 def connect():
-    db = sqlite3.connect(os.environ["DB_PATH"])
+    # A generous timeout: if build-db is writing, a post waits rather than failing.
+    db = sqlite3.connect(os.environ["DB_PATH"], timeout=120)
     db.row_factory = sqlite3.Row
+    # WAL lets a post read while build-db writes, and syncs to disk far less often,
+    # which matters on a slow USB disk. It's remembered in the database file.
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
     db.executescript(SCHEMA)
     # Databases made before clean frames existed lack this column.
     if "segments" not in {row[1] for row in db.execute("PRAGMA table_info(shots)")}:
@@ -195,6 +202,7 @@ def build_db(db, shots_dir, full=False):
     started = time.monotonic()
     print(f"Looking for episodes in {shots_dir}...", flush=True)
     found = find_episodes(shots_dir)
+    finding = time.monotonic() - started
     if not found:
         sys.exit(f"No subtitles.csv files under {shots_dir}")
     loaded = {d: (m, s) for d, m, s in db.execute("SELECT dir, csv_mtime, csv_size FROM episodes")}
@@ -205,6 +213,7 @@ def build_db(db, shots_dir, full=False):
     before = db.execute("SELECT count(*) FROM shots").fetchone()[0]
     known_dirs = {d for (d,) in db.execute("SELECT DISTINCT dir FROM shots")}
     new_episodes = removed = 0
+    load_start = time.monotonic()
     tty = sys.stdout.isatty()
     with db:
         for i, (path, st) in enumerate(todo, 1):
@@ -223,6 +232,11 @@ def build_db(db, shots_dir, full=False):
                     dir = excluded.dir, programme = excluded.programme, series = excluded.series,
                     episode = excluded.episode, title = excluded.title, start = excluded.start,
                     end = excluded.end, text = excluded.text, segments = excluded.segments
+                -- Only rewrite rows that actually changed.
+                WHERE (shots.dir, shots.programme, shots.series, shots.episode, shots.title,
+                       shots.start, shots.end, shots.text, shots.segments)
+                    IS NOT (excluded.dir, excluded.programme, excluded.series, excluded.episode,
+                            excluded.title, excluded.start, excluded.end, excluded.text, excluded.segments)
             """, [
                 (p, rel_dir.as_posix(), programme, series, number, title,
                  float(r["start"]), float(r["end"]), r["text"], r.get("segments") or None)
@@ -231,16 +245,25 @@ def build_db(db, shots_dir, full=False):
             removed += remove_old_shots(db, rel_dir.as_posix(), shot_paths)
             db.execute("INSERT OR REPLACE INTO episodes (dir, csv_mtime, csv_size) VALUES (?, ?, ?)",
                        (rel_dir.as_posix(), st.st_mtime, st.st_size))
-        # Tags are applied to every episode each time, so editing TAGS takes effect without --full.
-        db.execute("UPDATE shots SET tag = NULL WHERE tag IS NOT NULL")
-        for tag, titles in TAGS.items():
-            db.execute(f"UPDATE shots SET tag = ? WHERE title IN ({','.join('?' * len(titles))})",
-                       [tag, *titles])
+        loading = time.monotonic() - load_start
+        # Tags are (re)applied when episodes were loaded or TAGS has been edited, so
+        # editing TAGS takes effect without --full; only rows whose tag changes are written.
+        tag_start = time.monotonic()
+        tags_now = json.dumps({tag: sorted(titles) for tag, titles in TAGS.items()}, sort_keys=True)
+        tags_before = db.execute("SELECT value FROM meta WHERE key = 'tags'").fetchone()
+        if todo or not tags_before or tags_before[0] != tags_now:
+            cases = " ".join(f"WHEN title IN ({','.join('?' * len(titles))}) THEN ?" for titles in TAGS.values())
+            params = [x for tag, titles in TAGS.items() for x in (*titles, tag)]
+            tag_of = f"CASE {cases} END"
+            db.execute(f"UPDATE shots SET tag = {tag_of} WHERE tag IS NOT {tag_of}", params * 2)
+            db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('tags', ?)", (tags_now,))
+        tagging = time.monotonic() - tag_start
     if tty:
         sys.stdout.write("\r\033[K")
     total = db.execute("SELECT count(*) FROM shots").fetchone()[0]
     added = total - before + removed
-    print(f"Done in {time.monotonic() - started:.1f}s: {new_episodes} new episode(s), "
+    print(f"Done in {time.monotonic() - started:.1f}s (finding {finding:.1f}s, loading {len(todo)} "
+          f"episode(s) {loading:.1f}s, tags {tagging:.1f}s): {new_episodes} new episode(s), "
           f"{added} new shot(s), {removed} removed, {total} in total")
     for programme, episodes, shots in db.execute(
         "SELECT programme, count(DISTINCT dir), count(*) FROM shots GROUP BY programme ORDER BY programme"

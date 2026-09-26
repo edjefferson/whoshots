@@ -36,7 +36,7 @@ shots/
 # Generated data
 *.csv
 .cache/
-whobot.db
+whobot.db*
 whobot.env
 
 # Python
@@ -56,7 +56,7 @@ Thumbs.db
 
 # Local caches and generated catalogue
 .cache/
-whobot.db
+whobot.db*
 whobot.env
 episodes.csv
 
