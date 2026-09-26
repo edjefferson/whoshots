@@ -4,10 +4,17 @@
     whobot.py build-db [SHOTS_DIR]   load new/changed shots from SHOTS_DIR/**/subtitles.csv
     whobot.py post [--dry-run]       post the next shot (run hourly by a systemd timer)
     whobot.py stats                  how far through the shots it's got
+    whobot.py prune-images           list (--delete: remove) images no shot uses any more
 
 Shots are posted least-posted first, at random, so every shot is posted once
 before any is posted twice. On Christmas Day only Christmas episodes are used,
 and on New Year's Day only New Year's ones.
+
+Shots come in two kinds: with the subtitle burned into the image (classic
+episodes), or clean frames whose subtitle is stored as text with its speaker
+colours (iPlayer episodes, see iplayer_shots.py). For those the subtitle is
+drawn on when posting. Every image is scaled up before uploading, as Bluesky
+re-compresses what it's given and a bigger image comes through cleaner.
 
 Settings come from the environment, or from whobot.env next to this script:
 
@@ -18,12 +25,17 @@ Settings come from the environment, or from whobot.env next to this script:
     POST_TEXT, ALT_TEXT              templates, using {programme} {series}
                                      {episode} {title} {text} {timestamp} {path};
                                      \\n for a new line
+    UPLOAD_WIDTH                     scale images up to this width before posting
+                                     (default: 1920; 0 = as stored)
+    SUBTITLE_FONT                    font file for drawn subtitles (default: DejaVu
+                                     Sans on Linux, Arial on a Mac)
 """
 
 import argparse
 import csv
 import datetime
 import io
+import json
 import os
 import re
 import shutil
@@ -41,7 +53,17 @@ DEFAULTS = {
     "DB_PATH": str(HERE / "whobot.db"),
     "POST_TEXT": "",
     "ALT_TEXT": "{text}\\n\\nDoctor Who, {title} ({series})",
+    "UPLOAD_WIDTH": "1920",
+    "SUBTITLE_FONT": "",
 }
+
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+]
+BLUESKY_MAX_BYTES = 950_000  # Bluesky's limit is about 1 MB
 
 # Episode titles (as in the folder names) posted on these days.
 TAGS = {
@@ -69,6 +91,7 @@ CREATE TABLE IF NOT EXISTS shots (
     start REAL,
     end REAL,
     text TEXT,
+    segments TEXT,                -- JSON lines of [text, colour] runs if the subtitle isn't burned in
     tag TEXT,                     -- christmas, new_year or NULL
     skip INTEGER NOT NULL DEFAULT 0,
     post_count INTEGER NOT NULL DEFAULT 0,
@@ -106,6 +129,9 @@ def connect():
     db = sqlite3.connect(os.environ["DB_PATH"])
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    # Databases made before clean frames existed lack this column.
+    if "segments" not in {row[1] for row in db.execute("PRAGMA table_info(shots)")}:
+        db.execute("ALTER TABLE shots ADD COLUMN segments TEXT")
     return db
 
 
@@ -148,6 +174,23 @@ def status_line(text):
     sys.stdout.flush()
 
 
+def remove_old_shots(db, dir, keep):
+    """Delete an episode's shots its CSV no longer lists (e.g. it was redone); return how many.
+
+    A redone episode's new shots have new names, so each old shot's post count
+    is carried over to the new shot of the same subtitle (same start time),
+    to keep already-posted lines from being posted again first.
+    """
+    others = f"dir = ? AND path NOT IN ({','.join('?' * len(keep))})"
+    for old in db.execute(f"SELECT start, post_count, last_posted_at, post_uri FROM shots "
+                          f"WHERE {others} AND post_count > 0", [dir, *keep]).fetchall():
+        db.execute(f"""
+            UPDATE shots SET post_count = max(post_count, ?), last_posted_at = ?, post_uri = ?
+            WHERE dir = ? AND abs(start - ?) < 0.05 AND path IN ({','.join('?' * len(keep))})
+        """, [old["post_count"], old["last_posted_at"], old["post_uri"], dir, old["start"], *keep])
+    return db.execute(f"DELETE FROM shots WHERE {others}", [dir, *keep]).rowcount
+
+
 def build_db(db, shots_dir, full=False):
     started = time.monotonic()
     print(f"Looking for episodes in {shots_dir}...", flush=True)
@@ -174,22 +217,18 @@ def build_db(db, shots_dir, full=False):
                 rows = [r for r in csv.DictReader(f) if r["shot"]]
             shot_paths = [(rel_dir / r["shot"]).as_posix() for r in rows]
             db.executemany("""
-                INSERT INTO shots (path, dir, programme, series, episode, title, start, end, text)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO shots (path, dir, programme, series, episode, title, start, end, text, segments)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path) DO UPDATE SET
                     dir = excluded.dir, programme = excluded.programme, series = excluded.series,
                     episode = excluded.episode, title = excluded.title, start = excluded.start,
-                    end = excluded.end, text = excluded.text
+                    end = excluded.end, text = excluded.text, segments = excluded.segments
             """, [
                 (p, rel_dir.as_posix(), programme, series, number, title,
-                 float(r["start"]), float(r["end"]), r["text"])
+                 float(r["start"]), float(r["end"]), r["text"], r.get("segments") or None)
                 for p, r in zip(shot_paths, rows)
             ])
-            # Shots this episode's CSV no longer lists (e.g. it was redone).
-            removed += db.execute(
-                f"DELETE FROM shots WHERE dir = ? AND path NOT IN ({','.join('?' * len(shot_paths))})",
-                [rel_dir.as_posix(), *shot_paths],
-            ).rowcount
+            removed += remove_old_shots(db, rel_dir.as_posix(), shot_paths)
             db.execute("INSERT OR REPLACE INTO episodes (dir, csv_mtime, csv_size) VALUES (?, ?, ?)",
                        (rel_dir.as_posix(), st.st_mtime, st.st_size))
         # Tags are applied to every episode each time, so editing TAGS takes effect without --full.
@@ -243,18 +282,84 @@ def load_image(path):
     return (Path(os.environ["IMAGES_DIR"]) / path).read_bytes()
 
 
-def post(db, dry_run, day):
+def subtitle_font(size):
+    from PIL import ImageFont
+
+    path = os.environ["SUBTITLE_FONT"] or next((f for f in FONT_CANDIDATES if Path(f).exists()), None)
+    return ImageFont.truetype(path, size) if path else ImageFont.load_default(size)
+
+
+def wrap_runs(draw, line, font, max_width):
+    """Split one subtitle line (a list of [text, colour] runs) into lines that fit max_width."""
+    words = [(word, colour) for text, colour in line for word in re.findall(r"\S+\s*|\s+", text)]
+    lines, current = [], []
+    for word in words:
+        trial = current + [word]
+        if current and draw.textlength("".join(w for w, _ in trial).rstrip(), font=font) > max_width:
+            lines.append(current)
+            current = [word] if word[0].strip() else []
+        else:
+            current = trial
+    lines.append(current)
+    return [line for line in lines if "".join(w for w, _ in line).strip()]
+
+
+def draw_subtitles(img, lines):
+    """Draw subtitle lines onto a frame: bottom centre, each run in its speaker's
+    colour, with a black outline (the same size and look as subshots.py's)."""
+    from PIL import ImageDraw
+
+    w, h = img.size
+    size = max(12, round(h * 0.055))
+    font = subtitle_font(size)
+    draw = ImageDraw.Draw(img)
+    rows = [row for line in lines for row in wrap_runs(draw, line, font, w * 0.9)]
+    _, descent = font.getmetrics()
+    line_height = round(size * 1.2)
+    baseline = h - h * 0.05 - descent - line_height * (len(rows) - 1)
+    for row in rows:
+        row[-1] = (row[-1][0].rstrip(), row[-1][1])
+        x = (w - draw.textlength("".join(t for t, _ in row), font=font)) / 2
+        for text, colour in row:
+            draw.text((x, baseline), text, font=font, fill=colour, anchor="ls",
+                      stroke_width=max(2, size // 14), stroke_fill="black")
+            x += draw.textlength(text, font=font)
+        baseline += line_height
+
+
+def prepare_image(shot, data):
+    """The image to upload: scaled up, with the subtitle drawn on if it isn't burned in."""
     from PIL import Image
 
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    upload_width = int(os.environ["UPLOAD_WIDTH"] or 0)
+    if upload_width and img.width < upload_width:
+        img = img.resize((upload_width, round(img.height * upload_width / img.width)), Image.LANCZOS)
+    if shot["segments"]:
+        # Drawn after scaling up, so the text is sharp at full size.
+        draw_subtitles(img, json.loads(shot["segments"]))
+    for quality in (90, 85, 80, 75, 70):
+        out = io.BytesIO()
+        img.save(out, "JPEG", quality=quality)
+        if out.tell() <= BLUESKY_MAX_BYTES:
+            break
+    return out.getvalue(), img.size
+
+
+def post(db, dry_run, day, save=None):
     shot = pick(db, day)
     if not shot:
         sys.exit("No shots in the database; run build-db first.")
     text = render(os.environ["POST_TEXT"], shot)
     alt = render(os.environ["ALT_TEXT"], shot)
-    image = load_image(shot["path"])
-    width, height = Image.open(io.BytesIO(image)).size
-    print(f"{shot['path']} ({width}x{height}, posted {shot['post_count']}x before)")
+    image, (width, height) = prepare_image(shot, load_image(shot["path"]))
+    kind = "subtitle drawn on" if shot["segments"] else "subtitle burned in"
+    print(f"{shot['path']} ({kind}, uploading {width}x{height} {len(image) // 1024} KB, "
+          f"posted {shot['post_count']}x before)")
     print(f"text: {text!r}\nalt:  {alt!r}")
+    if save:
+        Path(save).write_bytes(image)
+        print(f"saved {save}")
     if dry_run:
         return
 
@@ -276,6 +381,33 @@ def post(db, dry_run, day):
 
 # --- stats --------------------------------------------------------------------
 
+def prune_images(db, delete):
+    """Images in the episode folders the database knows about that no shot uses,
+    e.g. old burned-in frames left behind after an episode was redone."""
+    if os.environ.get("IMAGES_URL"):
+        sys.exit("prune-images only works on a local IMAGES_DIR.")
+    root = Path(os.environ["IMAGES_DIR"])
+    used = {p for (p,) in db.execute("SELECT path FROM shots")}
+    unused = []
+    for (d,) in db.execute("SELECT DISTINCT dir FROM shots ORDER BY dir"):
+        folder = root / d
+        if folder.is_dir():
+            unused += [p for p in folder.iterdir()
+                       if p.suffix in {".jpg", ".png"} and p.relative_to(root).as_posix() not in used]
+    size = sum(p.stat().st_size for p in unused)
+    for p in unused[:10]:
+        print(f"  {p.relative_to(root)}")
+    if len(unused) > 10:
+        print(f"  ... and {len(unused) - 10} more")
+    print(f"{len(unused)} unused image(s), {size / 1e6:.0f} MB, in {len({p.parent for p in unused})} episode(s)")
+    if delete:
+        for p in unused:
+            p.unlink()
+        print("Deleted.")
+    elif unused:
+        print("Run again with --delete to remove them.")
+
+
 def stats(db):
     total, posted, lowest = db.execute(
         "SELECT count(*), sum(post_count > 0), min(post_count) FROM shots WHERE skip = 0"
@@ -283,6 +415,8 @@ def stats(db):
     episodes = db.execute("SELECT count(DISTINCT dir) FROM shots").fetchone()[0]
     print(f"{total} shots from {episodes} episodes, {posted or 0} posted at least once, "
           f"everything posted at least {lowest or 0}x")
+    clean = db.execute("SELECT count(*) FROM shots WHERE segments IS NOT NULL").fetchone()[0]
+    print(f"  {clean} with the subtitle drawn on when posting, {total - clean} burned in")
     for tag, count in db.execute("SELECT tag, count(*) FROM shots WHERE tag IS NOT NULL GROUP BY tag"):
         print(f"  {tag}: {count} shots")
     skipped = db.execute("SELECT count(*) FROM shots WHERE skip = 1").fetchone()[0]
@@ -301,8 +435,11 @@ def main():
     b.add_argument("--full", action="store_true", help="reload every episode, not just new or changed ones")
     p = sub.add_parser("post", help="post the next shot")
     p.add_argument("--dry-run", action="store_true", help="show what would be posted, without posting")
+    p.add_argument("--save", metavar="FILE", help="also save the image that would be uploaded")
     p.add_argument("--date", type=datetime.date.fromisoformat, default=None, help=argparse.SUPPRESS)
     sub.add_parser("stats", help="how far through the shots it's got")
+    pr = sub.add_parser("prune-images", help="list images no shot uses any more")
+    pr.add_argument("--delete", action="store_true", help="delete them")
     args = ap.parse_args()
 
     load_env()
@@ -310,7 +447,9 @@ def main():
     if args.command == "build-db":
         build_db(db, args.shots_dir or Path(os.environ["IMAGES_DIR"]), args.full)
     elif args.command == "post":
-        post(db, args.dry_run, args.date or datetime.date.today())
+        post(db, args.dry_run, args.date or datetime.date.today(), args.save)
+    elif args.command == "prune-images":
+        prune_images(db, args.delete)
     else:
         stats(db)
 

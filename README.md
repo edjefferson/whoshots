@@ -60,13 +60,16 @@ copying while the current one is screenshotted. Re-run to resume.
 ## iPlayer episodes
 
 ```sh
-python3 iplayer_urls.py                         # episode list -> iplayer_episodes.csv
-caffeinate -i .venv/bin/python iplayer_shots.py # download + screenshot everything -> output/
+python3 iplayer_urls.py                                   # episode list -> iplayer_episodes.csv
+caffeinate -i .venv/bin/python iplayer_shots.py --reverse # download + screenshot, newest first -> output/
 ```
 
-Each episode folder gets its screenshots plus `subtitles.srt` and `subtitles.csv`
-(shot, start, end, text). Videos are deleted once screenshotted; re-running skips
-finished episodes.
+Each subtitle gets a *clean* frame (`cNNNN_HH-MM-SS.mmm.jpg`, no subtitle burned in,
+up to 720p, JPEG quality 85). The subtitle itself goes in `subtitles.csv` (shot,
+start, end, text, segments), where `segments` keeps iPlayer's speaker colours, and
+the bot draws it on when posting. iPlayer's original `subtitles.ttml` is kept too.
+Videos are deleted once screenshotted; re-running skips finished episodes (those
+with a `.clean` marker) and redoes ones screenshotted the old burned-in way.
 
 ## Bluesky bot
 
@@ -80,6 +83,13 @@ cp whobot.env.example whobot.env && chmod 600 whobot.env   # then fill it in
 .venv/bin/python whobot.py post --dry-run
 .venv/bin/python whobot.py stats
 ```
+
+Classic episodes have their subtitles burned in and are posted as they are;
+iPlayer episodes' subtitles are drawn on at post time, in the speakers' colours.
+Every image is scaled up to 1920 wide first (`UPLOAD_WIDTH`), as Bluesky
+re-compresses uploads and larger images come through cleaner.
+`whobot.py prune-images` lists images no shot uses any more (e.g. old frames from
+a redone episode); add `--delete` to remove them.
 
 The images can be in a local folder (`IMAGES_DIR`) or on a web server (`IMAGES_URL`).
 In the URL case, `build-db` only needs the `subtitles.csv` files:

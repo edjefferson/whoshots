@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Download iPlayer episodes with subtitles and screenshot every subtitle cue.
+"""Download iPlayer episodes and take a clean screenshot for every subtitle.
 
-Reads the CSV written by iplayer_urls.py, downloads each episode with yt-dlp
-(subtitles converted to SRT), runs subshots.py on it, then deletes the video.
-The next episode downloads while the current one is being screenshotted.
+Reads the CSV written by iplayer_urls.py and downloads each episode with yt-dlp,
+along with its original subtitles (TTML). For each subtitle it saves the
+sharpest nearby frame *without* the subtitle burned in; the subtitle text, with
+iPlayer's speaker colours, goes in subtitles.csv so whobot.py can draw it on
+when posting. The video is then deleted. The next episode downloads while the
+current one is being screenshotted.
 
 Screenshots are filed by programme and series, e.g.
 
@@ -11,28 +14,39 @@ Screenshots are filed by programme and series, e.g.
     output/Doctor Who (2005–2022)/Series 01/14 - The Christmas Invasion/
     output/Doctor Who (2023–)/Season 01/01 - Space Babies/
 
-Each episode folder also gets subtitles.srt and subtitles.csv (shot, start,
-end, text: which line each screenshot shows, times in seconds).
+Each episode folder gets:
+    cNNNN_HH-MM-SS.mmm.jpg   one clean frame per subtitle (NNNN = its number)
+    subtitles.ttml           iPlayer's original subtitles
+    subtitles.csv            shot, start, end, text, segments: the subtitle each
+                             frame belongs to; segments is JSON, a list of lines,
+                             each a list of [text, "#rrggbb"] runs
 
 Specials go in the series iPlayer lists them under, numbered on from its last
-episode. Finished episodes are skipped, so it can be stopped and re-run;
-finished ones without subtitle files get just their subtitles downloaded.
+episode. Finished episodes are skipped, so it can be stopped and re-run.
+Episodes screenshotted the old way (subtitles burned in, no .clean marker) are
+redone: their old files are removed first.
 """
 
 import argparse
 import csv
+import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 HERE = Path(__file__).parent
 SHOT_EXTS = {".jpg", ".png"}
-DONE_MARKER = ".done"  # written once an episode's screenshots are complete
+DONE_MARKER = ".done"    # written once an episode's screenshots are complete
+CLEAN_MARKER = ".clean"  # ...and this one if they're clean frames (subtitles not burned in)
+JPEG_QUALITY = 85
 PROGRAMMES = {"Doctor Who": "Doctor Who (2023–)"}
 NUMBERED = re.compile(r"(?:.*: )?(\d+)\. (.+)")
 
@@ -65,7 +79,7 @@ def episode_dirs(rows):
 
 
 def has_shots(shots_dir):
-    return (shots_dir / DONE_MARKER).exists()
+    return (shots_dir / CLEAN_MARKER).exists()
 
 
 def short(name):
@@ -155,16 +169,7 @@ def stream(cmd, on_line):
 
 
 def download(row, dest, max_height, status, label):
-    """Download the episode and English subs; return (video, subs) paths."""
-    return fetch(row, dest, status, label, ["-S", f"res:{max_height}"] if max_height else [])
-
-
-def download_subs(row, dest, status, label):
-    """Download just the English subs; return their path."""
-    return fetch(row, dest, status, label, ["--skip-download"])[1]
-
-
-def fetch(row, dest, status, label, extra_args):
+    """Download the episode and its English TTML subtitles; return (video, subs) paths."""
 
     def on_line(line):
         if not line.startswith("PROGRESS "):
@@ -174,102 +179,205 @@ def fetch(row, dest, status, label, extra_args):
         return True
 
     status.set("download", f"↓ {label}")
+    # No point downloading more pixels than the screenshots keep.
+    sort = ["-S", f"res:{max_height}"] if max_height else []
     stream([
-        "yt-dlp", "--quiet", "--no-warnings", "--progress", "--newline", "--no-playlist", *extra_args,
+        "yt-dlp", "--quiet", "--no-warnings", "--progress", "--newline", "--no-playlist", *sort,
         "--progress-template", "download:PROGRESS %(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
-        "--write-subs", "--sub-langs", "en.*", "--convert-subs", "srt",
+        "--write-subs", "--sub-langs", "en.*", "--sub-format", "ttml",
         "-o", str(dest / f"{row['pid']}.%(ext)s"),
         row["url"],
     ], on_line)
     status.set("download")
     videos = [p for p in dest.glob(f"{row['pid']}.*") if p.suffix in {".mp4", ".mkv", ".webm"}]
-    subs = sorted(dest.glob(f"{row['pid']}.*.srt"))
+    subs = sorted(dest.glob(f"{row['pid']}.*.ttml"))
     if not subs:
         raise RuntimeError("no English subtitles available")
-    if not videos and "--skip-download" not in extra_args:
+    if not videos:
         raise RuntimeError("yt-dlp produced no video file")
-    return videos[0] if videos else None, subs[0]
+    return videos[0], subs[0]
 
 
-def trim_subtitles(video, subs):
-    """Drop subtitles that start after the video ends, and cut any that run past it.
+# --- Subtitles ------------------------------------------------------------------
 
-    iPlayer's subtitles sometimes run on past the end of the video (e.g. the
-    subtitler's credit after a longer broadcast ending).
+TT = "{http://www.w3.org/ns/ttml}"
+TTS = "{http://www.w3.org/ns/ttml#styling}"
+XML_ID = "{http://www.w3.org/XML/1998/namespace}id"
+WHITE = "#ffffff"
+
+
+def ttml_time(value):
+    """Seconds from a TTML clock time ("00:27:21.440", "00:27:48") or offset ("12.5s")."""
+    if m := re.fullmatch(r"(\d+):(\d+):(\d+(?:\.\d+)?)", value):
+        return int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+    if m := re.fullmatch(r"(\d+(?:\.\d+)?)(h|m|s|ms)", value):
+        return float(m[1]) * {"h": 3600, "m": 60, "s": 1, "ms": 0.001}[m[2]]
+    raise ValueError(f"unsupported TTML time: {value}")
+
+
+def parse_ttml(path, video_length=None):
+    """The cues in a TTML file, as dicts with start, end and lines.
+
+    Each line is a list of [text, colour] runs, the colour as "#rrggbb", so a
+    line can change colour mid-way when a second speaker starts. Paragraphs
+    shown at the same time (e.g. a sound label above dialogue) become one cue,
+    in document order. With video_length, cues starting after the video ends
+    are dropped and ones running past it cut short: iPlayer's subtitles
+    sometimes run on past the end (the subtitler's credit, say).
     """
-    import pysubs2
+    root = ET.parse(path).getroot()
+    styles = {s.get(XML_ID): s for s in root.iter(f"{TT}style")}
 
-    end = float(subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(video)],
-        check=True, capture_output=True, text=True,
-    ).stdout) * 1000 - 100  # ms, with a little margin for the last frame
-    srt = pysubs2.load(str(subs), encoding="utf-8")
-    srt.events = [ev for ev in srt.events if ev.start < end]
-    for ev in srt.events:
-        ev.end = min(ev.end, end)
-    srt.save(str(subs))
+    def colour_of(element, inherited):
+        for style_id in (element.get("style") or "").split():
+            if style_id in styles:
+                inherited = colour_of(styles[style_id], inherited)
+        if colour := element.get(f"{TTS}color"):
+            inherited = "#" + colour.lstrip("#")[:6].lower()
+        return inherited
+
+    def runs(element, colour, lines):
+        # Text inside an element takes its colour; text after it (tail) its parent's.
+        colour = colour_of(element, colour)
+        if element.text:
+            lines[-1].append([element.text, colour])
+        for child in element:
+            if child.tag == f"{TT}br":
+                lines.append([])
+            else:
+                runs(child, colour, lines)
+            if child.tail:
+                lines[-1].append([child.tail, colour])
+
+    paragraphs = []
+    for p in root.iter(f"{TT}p"):
+        start, end = ttml_time(p.get("begin")), ttml_time(p.get("end"))
+        lines = [[]]
+        runs(p, WHITE, lines)
+        lines = [line for line in map(tidy_line, lines) if line]
+        if lines and end > start:
+            paragraphs.append((start, end, lines))
+
+    if video_length is not None:
+        limit = video_length - 0.1  # a little margin for the last frame
+        paragraphs = [(s, min(e, limit), l) for s, e, l in paragraphs if s < limit]
+
+    # One cue per distinct (start, end), with everything visible at its midpoint.
+    cues = []
+    for start, end in sorted({(s, e) for s, e, _ in paragraphs}):
+        mid = (start + end) / 2
+        lines = [line for s, e, ls in paragraphs if s <= mid < e for line in ls]
+        cues.append({"start": start, "end": end, "lines": lines})
+    return cues
 
 
-def save_subtitles(subs, shots_dir):
-    """Keep the subtitles with the shots: the SRT, and a CSV of the cue each shot shows."""
-    from subshots import load_text_events, text_cues
+def tidy_line(line):
+    """Collapse whitespace (xml:space="default") and merge neighbouring runs of one colour."""
+    out = []
+    for text, colour in line:
+        text = re.sub(r"\s+", " ", text)
+        if out and out[-1][1] == colour:
+            out[-1][0] += text
+        elif text:
+            out.append([text, colour])
+    for run in out:
+        run[0] = re.sub(r"\s+", " ", run[0])
+    if out:
+        out[0][0] = out[0][0].lstrip()
+        out[-1][0] = out[-1][0].rstrip()
+    return [run for run in out if run[0]]
 
-    shutil.copyfile(subs, shots_dir / "subtitles.srt")
-    _, events = load_text_events(subs)
-    # subshots.py names shots NNNN_<time>, NNNN being the cue's number.
-    shots = {p.name[:4]: p.name for p in shots_dir.iterdir() if p.suffix in SHOT_EXTS}
+
+def plain_text(lines):
+    return "\n".join("".join(text for text, _ in line) for line in lines)
+
+
+# --- Screenshots ----------------------------------------------------------------
+
+def clear_episode(shots_dir):
+    """Remove an episode's old screenshots and subtitles so it can be redone."""
+    if not shots_dir.exists():
+        return
+    # The markers go first, so nothing (e.g. copying finished episodes to the Pi)
+    # treats a half-redone folder as finished.
+    for marker in (DONE_MARKER, CLEAN_MARKER):
+        (shots_dir / marker).unlink(missing_ok=True)
+    for p in shots_dir.iterdir():
+        if p.suffix in SHOT_EXTS or p.name.startswith("subtitles."):
+            p.unlink()
+
+
+def shoot(video, subs, shots_dir, max_height, jobs, keep_video, status, label):
+    """Save a clean frame for every cue plus the subtitle files; return how many frames."""
+    import subshots
+
+    subshots.MAX_HEIGHT = max_height or None
+    probe = subshots.ffprobe_json("-show_format", str(video))["format"]
+    video_length = float(probe["duration"]) - float(probe.get("start_time") or 0)
+    cues = parse_ttml(subs, video_length)
+    if not cues:
+        raise RuntimeError("no subtitles in the TTML")
+
+    clear_episode(shots_dir)
+    shots_dir.mkdir(parents=True, exist_ok=True)
+    status.set("shoot", f"▣ {label}")
+
+    def grab(i, cue, tmp):
+        c = subshots.Cue(cue["start"], cue["end"])
+        t, img = subshots.grab_sharpest(video, c, 0.4, False, Path(tmp) / f"{i:04d}")
+        name = f"c{i:04d}_{subshots.timestamp(t)}.jpg"
+        img.save(shots_dir / name, quality=JPEG_QUALITY)
+        return name
+
+    names = {}
+    failed = []
+    with tempfile.TemporaryDirectory() as tmp, ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {pool.submit(grab, i, cue, tmp): i for i, cue in enumerate(cues, 1)}
+        for done, fut in enumerate(as_completed(futures), 1):
+            i = futures[fut]
+            try:
+                names[i] = fut.result()
+            except Exception as e:
+                failed.append(f"cue {i} @ {cues[i - 1]['start']:.3f}s failed: {e}")
+            status.set("shoot", f"▣ {label} {done}/{len(cues)}")
+    status.set("shoot")
+    for line in failed:
+        status.log(f"    {line}")
+    if len(failed) > len(cues) // 20:
+        raise RuntimeError(f"{len(failed)} of {len(cues)} frames failed")
+
+    shutil.copyfile(subs, shots_dir / "subtitles.ttml")
     with open(shots_dir / "subtitles.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["shot", "start", "end", "text"])
-        for i, cue in enumerate(text_cues(events), 1):
-            writer.writerow([shots.get(f"{i:04d}", ""), f"{cue.start:.3f}", f"{cue.end:.3f}", cue.text])
-
-
-def shoot(video, subs, shots_dir, max_height, extra_args, keep_video, status, label):
-    """Screenshot every cue; return how many screenshots were taken."""
-
-    def on_line(line):
-        if m := re.fullmatch(r"(\d+)/(\d+)", line):
-            status.set("shoot", f"▣ {label} {m[1]}/{m[2]}")
-            return True
-        return line.startswith(tuple("0123456789"))  # "414 cues, renderer: ..."
-
-    status.set("shoot", f"▣ {label}")
-    trim_subtitles(video, subs)
-    try:
-        failed = stream([
-            sys.executable, "-u", str(HERE / "subshots.py"), str(video),
-            "-s", str(subs), "-o", str(shots_dir), "--max-height", str(max_height), *extra_args,
-        ], on_line)
-    finally:
-        status.set("shoot")
-    for line in failed:  # individual cues that failed, which subshots.py reports but carries on past
-        status.log(f"    {line}")
-    save_subtitles(subs, shots_dir)
+        writer.writerow(["shot", "start", "end", "text", "segments"])
+        for i, cue in enumerate(cues, 1):
+            writer.writerow([names.get(i, ""), f"{cue['start']:.3f}", f"{cue['end']:.3f}",
+                             plain_text(cue["lines"]), json.dumps(cue["lines"], ensure_ascii=False)])
     (shots_dir / DONE_MARKER).touch()
+    (shots_dir / CLEAN_MARKER).touch()
     if not keep_video:
         video.unlink()
         subs.unlink()
-    return sum(p.suffix in SHOT_EXTS for p in shots_dir.iterdir())
+    return len(names)
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Any unrecognised options are passed through to subshots.py (e.g. -f png, -j 4).",
-    )
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", type=Path, nargs="?", default=HERE / "iplayer_episodes.csv",
                     help="episode list from iplayer_urls.py (default: iplayer_episodes.csv)")
     ap.add_argument("-o", "--output", type=Path, default=HERE / "output",
                     help="where screenshots go (default: ./output); downloads go in its .downloads folder")
     ap.add_argument("-m", "--match", help="only episodes whose programme/episode matches this regex")
-    ap.add_argument("--limit", type=int, help="only do the first N matching episodes")
+    ap.add_argument("--limit", type=int, help="only do the first N episodes still to do")
+    ap.add_argument("--reverse", action="store_true", help="newest episodes first")
     ap.add_argument("--keep-video", action="store_true",
                     help="keep videos and subtitles instead of deleting them after screenshotting")
-    ap.add_argument("--max-height", type=int, default=576,
-                    help="download at about this height and scale shots down to it "
-                         "(default: 576, as subshots.py; 0 = best available)")
-    args, subshots_args = ap.parse_known_args()
+    ap.add_argument("--max-height", type=int, default=720,
+                    help="download at about this height and keep frames at most this tall "
+                         "(default: 720, iPlayer's best; 0 = no limit)")
+    ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4,
+                    help="frames to grab in parallel (default: number of CPUs)")
+    args = ap.parse_args()
 
     with open(args.csv, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
@@ -277,31 +385,20 @@ def main():
     if args.match:
         pattern = re.compile(args.match, re.I)
         rows = [r for r in rows if pattern.search(f"{r['programme']} {r['episode']}")]
-    if args.limit:
-        rows = rows[: args.limit]
+    if args.reverse:
+        rows.reverse()
     todo = [r for r in rows if not has_shots(args.output / dirs[r["pid"]])]
-    backfill = [r for r in rows if r not in todo and not (args.output / dirs[r["pid"]] / "subtitles.csv").exists()]
+    if args.limit:
+        todo = todo[: args.limit]
     if len(todo) < len(rows):
-        print(f"Skipping {len(rows) - len(todo)} episode(s) already done.")
-    downloads = args.output / ".downloads"
-    downloads.mkdir(parents=True, exist_ok=True)
-
-    if backfill:
-        print(f"Fetching subtitles for {len(backfill)} of them.")
-        status = Status(len(backfill))
-        for row in backfill:
-            name = dirs[row["pid"]]
-            try:
-                subs = download_subs(row, downloads, status, label=short(name))
-                save_subtitles(subs, args.output / name)
-                subs.unlink()
-                status.log(f"✓ {name}  subtitles", done=True)
-            except RuntimeError as e:
-                status.log(f"✗ {name}: subtitles failed\n    {e}", done=True)
-        status.clear()
+        print(f"Skipping {len(rows) - len(todo)} episode(s) already done (or over --limit).")
     if not todo:
         return
-    print(f"{len(todo)} episode(s) to do, screenshots in {args.output}")
+    redo = sum((args.output / dirs[r["pid"]]).exists() for r in todo)
+    downloads = args.output / ".downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    print(f"{len(todo)} episode(s) to do ({redo} replacing old burned-in screenshots), "
+          f"screenshots in {args.output}")
 
     status = Status(len(todo))
     failures = []
@@ -313,7 +410,7 @@ def main():
 
     def shoot_and_report(name, started, video, subs):
         shots_start = time.monotonic()
-        count = shoot(video, subs, args.output / name, args.max_height, subshots_args,
+        count = shoot(video, subs, args.output / name, args.max_height, args.jobs,
                       args.keep_video, status, label=short(name))
         status.log(f"✓ {name}  {count} shots  (download {duration(shots_start - started)}, "
                    f"shots {duration(time.monotonic() - shots_start)})", done=True)
@@ -345,7 +442,7 @@ def main():
 def wait(future, name, fail):
     try:
         future.result()
-    except RuntimeError as e:
+    except Exception as e:
         fail(name, "screenshots", e)
 
 
