@@ -249,14 +249,35 @@ def parse_ttml(path, video_length=None):
             if child.tail:
                 lines[-1].append([child.tail, colour])
 
+    def timed(element):
+        begin, end = element.get("begin"), element.get("end")
+        return ttml_time(begin) if begin else None, ttml_time(end) if end else None
+
     paragraphs = []
     for p in root.iter(f"{TT}p"):
-        start, end = ttml_time(p.get("begin")), ttml_time(p.get("end"))
-        lines = [[]]
-        runs(p, WHITE, lines)
-        lines = [line for line in map(tidy_line, lines) if line]
-        if lines and end > start:
-            paragraphs.append((start, end, lines))
+        start, end = timed(p)
+        if start is not None:
+            pieces = [(start, end, p, WHITE)]
+        else:
+            # Sometimes (e.g. sung lines in Gridlock) the paragraph has no timing and each
+            # line inside it is timed instead, so each becomes a subtitle of its own.
+            p_colour = colour_of(p, WHITE)
+            pieces = [(*timed(child), child, p_colour) for child in p if child.get("begin")]
+        for start, end, element, colour in pieces:
+            lines = [[]]
+            runs(element, colour, lines)
+            lines = [line for line in map(tidy_line, lines) if line]
+            if lines:
+                paragraphs.append([start, end, lines])
+
+    # Those inner timings can be missing or end before they start ("Rugged cross",
+    # 20:01.28 to 19:45.20): show such a line until the next subtitle, for up to 3 seconds.
+    starts = sorted({s for s, _, _ in paragraphs})
+    for para in paragraphs:
+        if para[1] is None or para[1] <= para[0]:
+            later = [s for s in starts if s > para[0]]
+            para[1] = min(later[0], para[0] + 3) if later else para[0] + 3
+    paragraphs = [tuple(p) for p in paragraphs]
 
     if video_length is not None:
         limit = video_length - 0.1  # a little margin for the last frame
