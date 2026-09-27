@@ -7,8 +7,8 @@
     whobot.py prune-images           list (--delete: remove) images no shot uses any more
 
 Shots are posted least-posted first, at random, so every shot is posted once
-before any is posted twice. On Christmas Day only Christmas episodes are used,
-and on New Year's Day only New Year's ones.
+before any is posted twice. Christmas and New Year episodes are tagged in the
+database (the tag column), but that doesn't affect what's posted.
 
 Shots come in two kinds: with the subtitle burned into the image (classic
 episodes), or clean frames whose subtitle is stored as text with its speaker
@@ -66,7 +66,8 @@ FONT_CANDIDATES = [
 ]
 BLUESKY_MAX_BYTES = 950_000  # Bluesky's limit is about 1 MB
 
-# Episode titles (as in the folder names) posted on these days.
+# Episode titles (as in the folder names) tagged in the database. The tags are only
+# recorded for now; picking shots ignores them.
 TAGS = {
     "christmas": {
         "The Christmas Invasion", "The Runaway Bride", "Voyage of the Damned", "The Next Doctor",
@@ -79,7 +80,6 @@ TAGS = {
         "The End of Time - Part Two", "Resolution", "Revolution of the Daleks", "Eve of the Daleks",
     },
 }
-TAG_DAYS = {(12, 25): "christmas", (1, 1): "new_year"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS shots (
@@ -294,11 +294,8 @@ def build_db(db, shots_dir, full=False):
 
 # --- post ---------------------------------------------------------------------
 
-def pick(db, day):
-    tag = TAG_DAYS.get((day.month, day.day))
-    query = "SELECT * FROM shots WHERE skip = 0 {} ORDER BY post_count, random() LIMIT 1"
-    shot = db.execute(query.format("AND tag = ?"), (tag,)).fetchone() if tag else None
-    return shot or db.execute(query.format("")).fetchone()
+def pick(db):
+    return db.execute("SELECT * FROM shots WHERE skip = 0 ORDER BY post_count, random() LIMIT 1").fetchone()
 
 
 def timestamp(seconds):
@@ -556,7 +553,7 @@ def record_post(db, path, uri, when):
         db.execute("DELETE FROM meta WHERE key = 'pending_post'")
 
 
-def post(db, dry_run, day, save=None):
+def post(db, dry_run, save=None):
     """Post the next shot.
 
     The shot and the post's record key are saved before posting. If a run fails,
@@ -585,7 +582,7 @@ def post(db, dry_run, day, save=None):
             print(f"Finishing the post that didn't complete last time ({pending['rkey']}).")
     if not shot:
         pending = None
-        shot = pick(db, day)
+        shot = pick(db)
     if not shot:
         sys.exit("No shots in the database; run build-db first.")
     text = render(os.environ["POST_TEXT"], shot)
@@ -683,7 +680,6 @@ def main():
     p = sub.add_parser("post", help="post the next shot")
     p.add_argument("--dry-run", action="store_true", help="show what would be posted, without posting")
     p.add_argument("--save", metavar="FILE", help="also save the image that would be uploaded")
-    p.add_argument("--date", type=datetime.date.fromisoformat, default=None, help=argparse.SUPPRESS)
     sub.add_parser("stats", help="how far through the shots it's got")
     pr = sub.add_parser("prune-images", help="list images no shot uses any more")
     pr.add_argument("--delete", action="store_true", help="delete them")
@@ -694,7 +690,7 @@ def main():
     if args.command == "build-db":
         build_db(db, args.shots_dir or Path(os.environ["IMAGES_DIR"]), args.full)
     elif args.command == "post":
-        post(db, args.dry_run, args.date or datetime.date.today(), args.save)
+        post(db, args.dry_run, args.save)
     elif args.command == "prune-images":
         prune_images(db, args.delete)
     else:

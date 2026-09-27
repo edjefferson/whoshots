@@ -85,8 +85,9 @@ with a `.clean` marker) and redoes ones screenshotted the old burned-in way.
 ## Bluesky bot
 
 `whobot.py` posts a random screenshot, least-posted first, so everything gets posted
-once before anything repeats. On Christmas Day it only posts Christmas episodes, and
-on New Year's Day New Year's ones. State is kept in a SQLite database (`whobot.db`).
+once before anything repeats. Christmas and New Year episodes are tagged in the
+database, but that doesn't change what's posted. State is kept in a SQLite database
+(`whobot.db`).
 
 ```sh
 cp whobot.env.example whobot.env && chmod 600 whobot.env   # then fill it in
