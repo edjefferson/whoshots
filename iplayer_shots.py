@@ -261,18 +261,41 @@ def ttml_time(value):
     raise ValueError(f"unsupported TTML time: {value}")
 
 
+BOTTOM = ["bottom", 0.95]  # where subtitles go when the TTML doesn't say
+
+
+def ttml_regions(root):
+    """{region id: [anchor, position]}: where a paragraph in that region goes, as the
+    bottom, top or centre of its text at a fraction of the picture's height."""
+    regions = {}
+    for r in root.iter(f"{TT}region"):
+        try:
+            oy = float(r.get(f"{TTS}origin").split()[1].rstrip("%")) / 100
+            eh = float(r.get(f"{TTS}extent").split()[1].rstrip("%")) / 100
+        except (AttributeError, IndexError, ValueError):
+            continue  # not given in percent
+        align = r.get(f"{TTS}displayAlign") or "after"
+        regions[r.get(XML_ID)] = (["top", oy] if align == "before" else
+                                  ["center", oy + eh / 2] if align == "center" else ["bottom", oy + eh])
+    return regions
+
+
 def parse_ttml(path, video_length=None):
-    """The cues in a TTML file, as dicts with start, end and lines.
+    """The cues in a TTML file, as dicts with start, end, lines and placement.
 
     Each line is a list of [text, colour] runs, the colour as "#rrggbb", so a
     line can change colour mid-way when a second speaker starts. Paragraphs
     shown at the same time (e.g. a sound label above dialogue) become one cue,
-    in document order. With video_length, cues starting after the video ends
-    are dropped and ones running past it cut short: iPlayer's subtitles
-    sometimes run on past the end (the subtitler's credit, say).
+    in document order. placement says where each paragraph's lines go, as
+    [number of lines, anchor, position] (see ttml_regions): the subtitler moves
+    them up, for instance, when there's text at the bottom of the picture. With
+    video_length, cues starting after the video ends are dropped and ones running
+    past it cut short: iPlayer's subtitles sometimes run on past the end (the
+    subtitler's credit, say).
     """
     root = ET.parse(path).getroot()
     styles = {s.get(XML_ID): s for s in root.iter(f"{TT}style")}
+    regions = ttml_regions(root)
 
     def colour_of(element, inherited):
         for style_id in (element.get("style") or "").split():
@@ -314,11 +337,11 @@ def parse_ttml(path, video_length=None):
             runs(element, colour, lines)
             lines = [line for line in map(tidy_line, lines) if line]
             if lines:
-                paragraphs.append([start, end, lines])
+                paragraphs.append([start, end, lines, regions.get(p.get("region"), BOTTOM)])
 
     # Those inner timings can be missing or end before they start ("Rugged cross",
     # 20:01.28 to 19:45.20): show such a line until the next subtitle, for up to 3 seconds.
-    starts = sorted({s for s, _, _ in paragraphs})
+    starts = sorted({p[0] for p in paragraphs})
     for para in paragraphs:
         if para[1] is None or para[1] <= para[0]:
             later = [s for s in starts if s > para[0]]
@@ -327,14 +350,15 @@ def parse_ttml(path, video_length=None):
 
     if video_length is not None:
         limit = video_length - 0.1  # a little margin for the last frame
-        paragraphs = [(s, min(e, limit), l) for s, e, l in paragraphs if s < limit]
+        paragraphs = [(s, min(e, limit), l, a) for s, e, l, a in paragraphs if s < limit]
 
     # One cue per distinct (start, end), with everything visible at its midpoint.
     cues = []
-    for start, end in sorted({(s, e) for s, e, _ in paragraphs}):
+    for start, end in sorted({(p[0], p[1]) for p in paragraphs}):
         mid = (start + end) / 2
-        lines = [line for s, e, ls in paragraphs if s <= mid < e for line in ls]
-        cues.append({"start": start, "end": end, "lines": lines})
+        showing = [(ls, a) for s, e, ls, a in paragraphs if s <= mid < e]
+        cues.append({"start": start, "end": end, "lines": [line for ls, _ in showing for line in ls],
+                     "placement": [[len(ls), *a] for ls, a in showing]})
     return cues
 
 
@@ -360,6 +384,41 @@ def plain_text(lines):
 
 
 # --- Screenshots ----------------------------------------------------------------
+
+def write_csv(path, shots):
+    """subtitles.csv from (shot filename, cue) pairs, written via a temporary file."""
+    tmp = path.with_suffix(".csv.tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["shot", "start", "end", "text", "segments", "placement"])
+        for shot, cue in shots:
+            writer.writerow([shot, f"{cue['start']:.3f}", f"{cue['end']:.3f}", plain_text(cue["lines"]),
+                             json.dumps(cue["lines"], ensure_ascii=False), json.dumps(cue["placement"])])
+    os.replace(tmp, path)
+
+
+def rewrite_csvs(output):
+    """Regenerate finished episodes' subtitles.csv from their saved subtitles.ttml,
+    e.g. after the parser learns something new. Shots are matched to cues by
+    start time, so nothing is re-screenshotted."""
+    changed = 0
+    for marker in sorted(output.glob("*/*/*/" + CLEAN_MARKER)):
+        folder = marker.parent
+        with open(folder / "subtitles.csv", newline="", encoding="utf-8") as f:
+            old = list(csv.DictReader(f))
+        cues = {f"{c['start']:.3f}": c for c in parse_ttml(folder / "subtitles.ttml")}
+        missing = [r["start"] for r in old if r["start"] not in cues]
+        if missing:
+            print(f"  {folder.relative_to(output)}: {len(missing)} cue(s) not found, left as they were")
+            continue
+        new = []
+        for r in old:
+            cue = dict(cues[r["start"]], end=float(r["end"]))  # keep ends trimmed to the video
+            new.append((r["shot"], cue))
+        write_csv(folder / "subtitles.csv", new)
+        changed += 1
+    print(f"Rewrote subtitles.csv for {changed} episode(s).")
+
 
 def clear_episode(shots_dir):
     """Remove an episode's old screenshots and subtitles so it can be redone."""
@@ -422,12 +481,7 @@ def shoot(video, subs, shots_dir, max_height, jobs, keep_video, status, label, a
         raise RuntimeError(f"{len(failed)} of {len(cues)} frames failed")
 
     shutil.copyfile(subs, shots_dir / "subtitles.ttml")
-    with open(shots_dir / "subtitles.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["shot", "start", "end", "text", "segments"])
-        for i, cue in enumerate(cues, 1):
-            writer.writerow([names.get(i, ""), f"{cue['start']:.3f}", f"{cue['end']:.3f}",
-                             plain_text(cue["lines"]), json.dumps(cue["lines"], ensure_ascii=False)])
+    write_csv(shots_dir / "subtitles.csv", [(names.get(i, ""), cue) for i, cue in enumerate(cues, 1)])
     (shots_dir / DONE_MARKER).touch()
     (shots_dir / CLEAN_MARKER).touch()
     if not keep_video:
@@ -452,7 +506,11 @@ def main():
                          "(default: 720, iPlayer's best; 0 = no limit)")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 4,
                     help="frames to grab in parallel (default: number of CPUs)")
+    ap.add_argument("--rewrite-csvs", action="store_true",
+                    help="just regenerate finished episodes' subtitles.csv from their saved subtitles.ttml")
     args = ap.parse_args()
+    if args.rewrite_csvs:
+        return rewrite_csvs(args.output)
 
     with open(args.csv, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))

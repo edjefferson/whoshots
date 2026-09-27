@@ -64,6 +64,12 @@ python3 iplayer_urls.py                                   # episode list -> ipla
 caffeinate -i .venv/bin/python iplayer_shots.py --reverse # download + screenshot, newest first -> output/
 ```
 
+Drawn subtitles go where the broadcast put them (the TTML's regions): usually at
+the bottom, but higher when there's text on screen, such as a reconstruction's
+captions. After a parser change, `iplayer_shots.py --rewrite-csvs` regenerates
+finished episodes' `subtitles.csv` from their saved `subtitles.ttml`, without
+re-screenshotting.
+
 To add single episodes, e.g. classic ones missing from the library, put their
 iPlayer URLs in `iplayer_extra.txt` and re-run `iplayer_urls.py`. Classic episodes
 go in the folder `batch_shots.py` would use (matched via `episodes.csv`) and are

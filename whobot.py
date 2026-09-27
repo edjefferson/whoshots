@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS shots (
     text TEXT,
     segments TEXT,                -- JSON lines of [text, colour] runs if the subtitle isn't burned in
     overlay TEXT,                 -- JSON {image, x, y}: a subtitle image to paste on, if kept separately
+    placement TEXT,               -- JSON [[lines, anchor, position], ...]: where drawn subtitles go
     tag TEXT,                     -- christmas, new_year or NULL
     skip INTEGER NOT NULL DEFAULT 0,
     post_count INTEGER NOT NULL DEFAULT 0,
@@ -139,7 +140,7 @@ def connect():
     db.executescript(SCHEMA)
     # Databases made before these existed lack the columns.
     columns = {row[1] for row in db.execute("PRAGMA table_info(shots)")}
-    for column in ("segments", "overlay"):
+    for column in ("segments", "overlay", "placement"):
         if column not in columns:
             db.execute(f"ALTER TABLE shots ADD COLUMN {column} TEXT")
     return db
@@ -237,23 +238,24 @@ def build_db(db, shots_dir, full=False):
                 rows = [r for r in csv.DictReader(f) if r["shot"]]
             shot_paths = [(rel_dir / r["shot"]).as_posix() for r in rows]
             db.executemany("""
-                INSERT INTO shots (path, dir, programme, series, episode, title, start, end, text, segments, overlay)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO shots (path, dir, programme, series, episode, title, start, end, text, segments,
+                                   overlay, placement)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path) DO UPDATE SET
                     dir = excluded.dir, programme = excluded.programme, series = excluded.series,
                     episode = excluded.episode, title = excluded.title, start = excluded.start,
                     end = excluded.end, text = excluded.text, segments = excluded.segments,
-                    overlay = excluded.overlay
+                    overlay = excluded.overlay, placement = excluded.placement
                 -- Only rewrite rows that actually changed.
                 WHERE (shots.dir, shots.programme, shots.series, shots.episode, shots.title,
-                       shots.start, shots.end, shots.text, shots.segments, shots.overlay)
+                       shots.start, shots.end, shots.text, shots.segments, shots.overlay, shots.placement)
                     IS NOT (excluded.dir, excluded.programme, excluded.series, excluded.episode,
                             excluded.title, excluded.start, excluded.end, excluded.text, excluded.segments,
-                            excluded.overlay)
+                            excluded.overlay, excluded.placement)
             """, [
                 (p, rel_dir.as_posix(), programme, series, number, title,
                  float(r["start"]), float(r["end"]), r["text"], r.get("segments") or None,
-                 overlay_json(rel_dir, r))
+                 overlay_json(rel_dir, r), r.get("placement") or None)
                 for p, r in zip(shot_paths, rows)
             ])
             removed += remove_old_shots(db, rel_dir.as_posix(), shot_paths)
@@ -341,27 +343,41 @@ def wrap_runs(draw, line, font, max_width):
     return [line for line in lines if "".join(w for w, _ in line).strip()]
 
 
-def draw_subtitles(img, lines):
-    """Draw subtitle lines onto a frame: bottom centre, each run in its speaker's
-    colour, with a black outline (the same size and look as subshots.py's)."""
+def draw_subtitles(img, lines, placement=None):
+    """Draw subtitle lines onto a frame, centred, each run in its speaker's colour,
+    with a black outline (the same size and look as subshots.py's).
+
+    placement, from the broadcast subtitles, says where each group of lines goes:
+    [number of lines, "bottom"/"top"/"center", fraction of the height]. Without it
+    they all go at the bottom.
+    """
     from PIL import ImageDraw
 
     w, h = img.size
     size = max(12, round(h * 0.055))
     font = subtitle_font(size)
     draw = ImageDraw.Draw(img)
-    rows = [row for line in lines for row in wrap_runs(draw, line, font, w * 0.9)]
-    _, descent = font.getmetrics()
+    ascent, descent = font.getmetrics()
     line_height = round(size * 1.2)
-    baseline = h - h * 0.05 - descent - line_height * (len(rows) - 1)
-    for row in rows:
-        row[-1] = (row[-1][0].rstrip(), row[-1][1])
-        x = (w - draw.textlength("".join(t for t, _ in row), font=font)) / 2
-        for text, colour in row:
-            draw.text((x, baseline), text, font=font, fill=colour, anchor="ls",
-                      stroke_width=max(2, size // 14), stroke_fill="black")
-            x += draw.textlength(text, font=font)
-        baseline += line_height
+    placement = placement or [[len(lines), "bottom", 0.95]]
+    start = 0
+    for count, anchor, position in placement:
+        rows = [row for line in lines[start:start + count] for row in wrap_runs(draw, line, font, w * 0.9)]
+        start += count
+        if not rows:
+            continue
+        height = line_height * (len(rows) - 1) + ascent + descent
+        top = {"top": position * h, "center": position * h - height / 2}.get(anchor, position * h - height)
+        top = min(max(top, h * 0.02), h * 0.98 - height)  # keep it on the picture
+        baseline = top + ascent
+        for row in rows:
+            row[-1] = (row[-1][0].rstrip(), row[-1][1])
+            x = (w - draw.textlength("".join(t for t, _ in row), font=font)) / 2
+            for text, colour in row:
+                draw.text((x, baseline), text, font=font, fill=colour, anchor="ls",
+                          stroke_width=max(2, size // 14), stroke_fill="black")
+                x += draw.textlength(text, font=font)
+            baseline += line_height
 
 
 def prepare_image(shot, data):
@@ -385,7 +401,8 @@ def prepare_image(shot, data):
         img.paste(sub, (x, y), sub)
     if shot["segments"]:
         # Drawn after scaling up, so the text is sharp at full size.
-        draw_subtitles(img, json.loads(shot["segments"]))
+        draw_subtitles(img, json.loads(shot["segments"]),
+                       json.loads(shot["placement"]) if shot["placement"] else None)
     for quality in (90, 85, 80, 75, 70):
         out = io.BytesIO()
         img.save(out, "JPEG", quality=quality)
