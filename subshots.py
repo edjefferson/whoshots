@@ -400,13 +400,18 @@ def ocr_images(images, jobs):
 
 # Words tesseract capitalises by misreading "i" as "I"; never capitalised mid-sentence.
 I_WORDS = re.compile(r"(?<=[a-z,] )(Is|It|It's|Its|In|If|Into)\b")
+NUMBERISH = re.compile(r"(?<![A-Za-z])[\dQ@Ø]+(?:[,.][\dQ@Ø]+)*")
+ZEROS = str.maketrans("Q@Ø", "000")
 
 
 def fix_ocr(line):
     """Correct tesseract's usual mistakes on subtitle fonts."""
     line = re.sub(r"(?<![\w|])\|(?![\w|])", "I", line)  # a lone "|" is a misread "I"
     line = I_WORDS.sub(lambda m: m[1].lower(), line)
-    # Slashed zeros read as Q or @, e.g. "6-Q" for "6-0".
+    # Slashed zeros read as Q, @ or Ø: in anything number-like with a real digit in
+    # it they're zeros ("1@" for "10", "198Qs" for "1980s", "10,0@@" for "10,000"),
+    # as are ones next to a dash in a score, e.g. "6-Q" for "6-0".
+    line = NUMBERISH.sub(lambda m: m[0].translate(ZEROS) if re.search(r"\d", m[0]) else m[0], line)
     line = re.sub(r"(?<=\d-)(Q@|Q|@|Ø)|(Q@|Q|@|Ø)(?=-\d)", "0", line)
     # Dialogue dashes run into the next letter: "-Wwhat"/"-\What" for "-What",
     # and "“Ves" for "-Yes".
