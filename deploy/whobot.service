@@ -6,9 +6,17 @@ Wants=network-online.target
 After=network-online.target
 # Don't run before the disk holding the bot is mounted.
 RequiresMountsFor=@DIR@
+# If a post fails (e.g. Bluesky not responding), try again after 10 minutes, up to
+# 3 times an hour; whobot.py finishes the unfinished post without duplicating it.
+StartLimitIntervalSec=1h
+StartLimitBurst=4
 
 [Service]
 Type=oneshot
 User=@USER@
 # Settings are read from whobot.env next to whobot.py.
 ExecStart=@DIR@/.venv/bin/python @DIR@/whobot.py post
+Restart=on-failure
+RestartSec=10min
+# Log output as it happens rather than all at the end.
+Environment=PYTHONUNBUFFERED=1

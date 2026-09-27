@@ -37,6 +37,7 @@ import datetime
 import io
 import json
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -414,6 +415,28 @@ def prepare_image(shot, data):
 POST_TRIES = 3
 RETRY_WAIT = 30  # seconds
 BLUESKY_TIMEOUT = 30  # seconds per request; the library's default of 5 was sometimes too short
+TID_CHARS = "234567abcdefghijklmnopqrstuvwxyz"
+
+
+def new_tid():
+    """A record key in Bluesky's TID format: microseconds since 1970 and a random
+    clock id, in its sortable base 32."""
+    n = (time.time_ns() // 1000) << 10 | random.getrandbits(10)
+    return "".join(TID_CHARS[(n >> (5 * i)) & 31] for i in reversed(range(13)))
+
+
+def with_retries(what, fn):
+    """Run fn, retrying if Bluesky times out or the network fails (it's occasionally slow)."""
+    from atproto_client.exceptions import InvokeTimeoutError, NetworkError
+
+    for attempt in range(1, POST_TRIES + 1):
+        try:
+            return fn()
+        except (InvokeTimeoutError, NetworkError) as e:
+            if attempt == POST_TRIES:
+                raise
+            print(f"{what}: Bluesky didn't respond ({type(e).__name__}); trying again in {RETRY_WAIT}s", flush=True)
+            time.sleep(RETRY_WAIT)
 
 
 def bluesky_client():
@@ -441,8 +464,60 @@ def bluesky_client():
     return client
 
 
+def send_post(shot, image, size, text, alt, rkey, created_at):
+    """Post the image with a fixed record key, and return the post's URI.
+
+    Creating the post is the one step that isn't safe to simply retry: it may have
+    gone through even though the reply didn't arrive. With a fixed key, a retry
+    (in this run or a later one) first checks whether that post already exists.
+    """
+    from atproto import models
+    from atproto_client.exceptions import BadRequestError
+
+    client = with_retries("logging in", bluesky_client)
+    did = client._session.did
+    uri = f"at://{did}/app.bsky.feed.post/{rkey}"
+
+    def exists():
+        try:
+            client.com.atproto.repo.get_record({"repo": did, "collection": "app.bsky.feed.post", "rkey": rkey})
+            return True
+        except BadRequestError:  # RecordNotFound
+            return False
+
+    if with_retries("checking for an earlier attempt", exists):
+        print("That post already went through on an earlier attempt.")
+        return uri
+    blob = with_retries("uploading the image", lambda: client.upload_blob(image).blob)
+    record = models.AppBskyFeedPost.Record(
+        created_at=created_at, text=text, langs=["en"],
+        embed=models.AppBskyEmbedImages.Main(images=[models.AppBskyEmbedImages.Image(
+            alt=alt, image=blob,
+            aspect_ratio=models.AppBskyEmbedDefs.AspectRatio(width=size[0], height=size[1]))]),
+    )
+    first = [True]
+
+    def create():
+        if not first[0] and exists():  # a timed-out attempt may have worked
+            return uri
+        first[0] = False
+        return client.app.bsky.feed.post.create(did, record, rkey=rkey).uri
+
+    return with_retries("posting", create)
+
+
 def post(db, dry_run, day, save=None):
-    shot = pick(db, day)
+    """Post the next shot. The shot and the post's record key are saved first, so if
+    posting fails the next run finishes that post (without duplicating it) before
+    picking another."""
+    pending = db.execute("SELECT value FROM meta WHERE key = 'pending_post'").fetchone()
+    pending = json.loads(pending[0]) if pending else None
+    shot = pending and db.execute("SELECT * FROM shots WHERE path = ?", (pending["path"],)).fetchone()
+    if shot:
+        print(f"Finishing the post that didn't complete last time ({pending['rkey']}).")
+    else:
+        pending = None
+        shot = pick(db, day)
     if not shot:
         sys.exit("No shots in the database; run build-db first.")
     text = render(os.environ["POST_TEXT"], shot)
@@ -452,36 +527,27 @@ def post(db, dry_run, day, save=None):
             else "subtitle burned in")
     print(f"{shot['path']} ({kind}, uploading {width}x{height} {len(image) // 1024} KB, "
           f"posted {shot['post_count']}x before)")
-    print(f"text: {text!r}\nalt:  {alt!r}")
+    print(f"text: {text!r}\nalt:  {alt!r}", flush=True)
     if save:
         Path(save).write_bytes(image)
         print(f"saved {save}")
     if dry_run:
         return
 
-    from atproto import models
-    from atproto_client.exceptions import InvokeTimeoutError, NetworkError
-
-    # Bluesky is occasionally slow to answer; wait and try again rather than miss the hour.
-    for attempt in range(1, POST_TRIES + 1):
-        try:
-            client = bluesky_client()
-            resp = client.send_image(
-                text=text, image=image, image_alt=alt,
-                image_aspect_ratio=models.AppBskyEmbedDefs.AspectRatio(width=width, height=height),
-            )
-            break
-        except (InvokeTimeoutError, NetworkError) as e:
-            if attempt == POST_TRIES:
-                raise
-            print(f"Bluesky didn't respond ({type(e).__name__}); trying again in {RETRY_WAIT}s", flush=True)
-            time.sleep(RETRY_WAIT)
+    if not pending:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        pending = {"path": shot["path"], "rkey": new_tid(),
+                   "created_at": now.isoformat(timespec="milliseconds").replace("+00:00", "Z")}
+        with db:
+            db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pending_post', ?)", (json.dumps(pending),))
+    uri = send_post(shot, image, (width, height), text, alt, pending["rkey"], pending["created_at"])
     with db:
         db.execute(
             "UPDATE shots SET post_count = post_count + 1, last_posted_at = ?, post_uri = ? WHERE path = ?",
-            (datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), resp.uri, shot["path"]),
+            (pending["created_at"], uri, shot["path"]),
         )
-    print(f"posted {resp.uri}")
+        db.execute("DELETE FROM meta WHERE key = 'pending_post'")
+    print(f"posted {uri}")
 
 
 # --- stats --------------------------------------------------------------------
