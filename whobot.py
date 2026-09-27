@@ -411,6 +411,36 @@ def prepare_image(shot, data):
     return out.getvalue(), img.size
 
 
+POST_TRIES = 3
+RETRY_WAIT = 30  # seconds
+BLUESKY_TIMEOUT = 30  # seconds per request; the library's default of 5 was sometimes too short
+
+
+def bluesky_client():
+    """A logged-in Bluesky client, reusing the session saved last time if it's still
+    good (Bluesky rate-limits logins, and logging in is the call that was timing out)."""
+    from atproto import Client
+    from atproto_client.request import Request
+
+    session_file = Path(os.environ["DB_PATH"]).with_name("whobot.session")
+
+    def save_session(*_):
+        session_file.write_text(client.export_session_string(), encoding="utf-8")
+        session_file.chmod(0o600)
+
+    client = Client(request=Request(timeout=BLUESKY_TIMEOUT))
+    client.on_session_change(save_session)
+    if session_file.exists():
+        try:
+            client.login(session_string=session_file.read_text(encoding="utf-8"), fetch_bsky_profile=False)
+            return client
+        except Exception as e:  # expired or revoked: log in afresh
+            print(f"Saved session didn't work ({type(e).__name__}); logging in", flush=True)
+    client.login(os.environ["BSKY_HANDLE"], os.environ["BSKY_APP_PASSWORD"], fetch_bsky_profile=False)
+    save_session()
+    return client
+
+
 def post(db, dry_run, day, save=None):
     shot = pick(db, day)
     if not shot:
@@ -429,14 +459,23 @@ def post(db, dry_run, day, save=None):
     if dry_run:
         return
 
-    from atproto import Client, models
+    from atproto import models
+    from atproto_client.exceptions import InvokeTimeoutError, NetworkError
 
-    client = Client()
-    client.login(os.environ["BSKY_HANDLE"], os.environ["BSKY_APP_PASSWORD"])
-    resp = client.send_image(
-        text=text, image=image, image_alt=alt,
-        image_aspect_ratio=models.AppBskyEmbedDefs.AspectRatio(width=width, height=height),
-    )
+    # Bluesky is occasionally slow to answer; wait and try again rather than miss the hour.
+    for attempt in range(1, POST_TRIES + 1):
+        try:
+            client = bluesky_client()
+            resp = client.send_image(
+                text=text, image=image, image_alt=alt,
+                image_aspect_ratio=models.AppBskyEmbedDefs.AspectRatio(width=width, height=height),
+            )
+            break
+        except (InvokeTimeoutError, NetworkError) as e:
+            if attempt == POST_TRIES:
+                raise
+            print(f"Bluesky didn't respond ({type(e).__name__}); trying again in {RETRY_WAIT}s", flush=True)
+            time.sleep(RETRY_WAIT)
     with db:
         db.execute(
             "UPDATE shots SET post_count = post_count + 1, last_posted_at = ?, post_uri = ? WHERE path = ?",

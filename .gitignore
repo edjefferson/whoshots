@@ -38,6 +38,7 @@ shots/
 .cache/
 whobot.db*
 whobot.env
+whobot.session
 
 # Python
 __pycache__/
@@ -58,6 +59,7 @@ Thumbs.db
 .cache/
 whobot.db*
 whobot.env
+whobot.session
 episodes.csv
 
 # Archives
