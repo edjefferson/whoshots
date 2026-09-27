@@ -168,8 +168,28 @@ def window_bounds(cue, window):
     return (lo, hi) if window > 0 and hi - lo >= 0.1 else None
 
 
-def grab_sharpest(video, cue, window, deinterlace, workdir, track=None, sub_image=None):
+def grab_sharpest(video, cue, window, deinterlace, workdir, track=None, sub_image=None, tries=3):
     """Return (time, image) of the sharpest frame near the cue's midpoint.
+
+    ffmpeg occasionally returns no frames for a window it handles fine on
+    another go (seen overlaying bitmap subtitles, e.g. Time-Flight Part 1), so
+    this retries, and as a last resort takes just the frame at the midpoint.
+    """
+    for attempt in range(tries):
+        try:
+            return _grab_sharpest(video, cue, window, deinterlace, workdir.with_name(f"{workdir.name}-{attempt}"),
+                                  track, sub_image)
+        except RuntimeError as e:
+            if "no frames" not in str(e):
+                raise
+    if window_bounds(cue, window) is None:
+        raise RuntimeError(f"no frames around {cue.mid:.3f}s after {tries} tries")
+    return grab_sharpest(video, cue, 0, deinterlace, workdir.with_name(f"{workdir.name}-mid"),
+                         track, sub_image, tries)
+
+
+def _grab_sharpest(video, cue, window, deinterlace, workdir, track=None, sub_image=None):
+    """One go at grab_sharpest.
 
     The exact midpoint often lands on a motion-blurred frame; nearby frames can
     be much crisper. One ffmpeg run decodes the window once, writing every
