@@ -62,3 +62,6 @@ episodes.csv
 
 # Archives
 *.zip
+
+# Working files for one-off specials
+work/
