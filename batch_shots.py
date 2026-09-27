@@ -63,8 +63,21 @@ def episode_dirs(rows):
     return dirs
 
 
+# Missing episodes whose animated stand-ins are done anyway (there's no reconstruction
+# to use instead): (story, part).
+ANIMATION_OK = {
+    ("The Reign of Terror", 4), ("The Reign of Terror", 5),
+    ("The Moonbase", 1), ("The Moonbase", 3),
+    ("The Ice Warriors", 2), ("The Ice Warriors", 3),
+    ("The Invasion", 1), ("The Invasion", 4),
+}
+
+
 def is_animation(row):
-    """Animated stand-in for a missing episode, including unlabelled ones presumed to be."""
+    """Animated stand-in for a missing episode, including unlabelled ones presumed to be,
+    unless it's one of those in ANIMATION_OK."""
+    if row["part"].isdigit() and (row["serial"], int(row["part"])) in ANIMATION_OK:
+        return False
     return row["version"].startswith("animation")
 
 
