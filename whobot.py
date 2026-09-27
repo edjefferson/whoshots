@@ -415,6 +415,7 @@ def prepare_image(shot, data):
 POST_TRIES = 3
 RETRY_WAIT = 30  # seconds
 BLUESKY_TIMEOUT = 30  # seconds per request; the library's default of 5 was sometimes too short
+TRY_AGAIN_LATER = 75  # exit status (EX_TEMPFAIL) that makes systemd retry the run in 10 minutes
 TID_CHARS = "234567abcdefghijklmnopqrstuvwxyz"
 
 
@@ -425,17 +426,33 @@ def new_tid():
     return "".join(TID_CHARS[(n >> (5 * i)) & 31] for i in reversed(range(13)))
 
 
-def with_retries(what, fn):
-    """Run fn, retrying if Bluesky times out or the network fails (it's occasionally slow)."""
-    from atproto_client.exceptions import InvokeTimeoutError, NetworkError
+def status_of(e):
+    return getattr(getattr(e, "response", None), "status_code", None)
 
+
+def is_transient(e):
+    """Whether an error is worth trying again: Bluesky not responding, a dropped
+    connection, rate limiting or a server error, rather than being refused."""
+    from atproto_client.exceptions import InvokeTimeoutError, RequestErrorBase
+
+    if isinstance(e, InvokeTimeoutError):
+        return True
+    if isinstance(e, RequestErrorBase):
+        status = status_of(e)
+        return status is None or status == 429 or status >= 500
+    return False
+
+
+def with_retries(what, fn):
+    """Run fn, retrying if the error is transient (Bluesky is occasionally slow)."""
     for attempt in range(1, POST_TRIES + 1):
         try:
             return fn()
-        except (InvokeTimeoutError, NetworkError) as e:
-            if attempt == POST_TRIES:
+        except Exception as e:
+            if attempt == POST_TRIES or not is_transient(e):
                 raise
-            print(f"{what}: Bluesky didn't respond ({type(e).__name__}); trying again in {RETRY_WAIT}s", flush=True)
+            print(f"{what}: Bluesky didn't respond ({type(e).__name__} {status_of(e) or ''}); "
+                  f"trying again in {RETRY_WAIT}s")
             time.sleep(RETRY_WAIT)
 
 
@@ -458,64 +475,115 @@ def bluesky_client():
             client.login(session_string=session_file.read_text(encoding="utf-8"), fetch_bsky_profile=False)
             return client
         except Exception as e:  # expired or revoked: log in afresh
-            print(f"Saved session didn't work ({type(e).__name__}); logging in", flush=True)
+            print(f"Saved session didn't work ({type(e).__name__}); logging in")
     client.login(os.environ["BSKY_HANDLE"], os.environ["BSKY_APP_PASSWORD"], fetch_bsky_profile=False)
     save_session()
     return client
 
 
-def send_post(shot, image, size, text, alt, rkey, created_at):
-    """Post the image with a fixed record key, and return the post's URI.
+def account_did(client):
+    # With fetch_bsky_profile=False (one request fewer), client.me isn't filled in;
+    # the session, which is private to the library, has the account's DID.
+    return client._session.did
+
+
+def post_exists(client, rkey):
+    """Whether this account has a post with this record key."""
+    from atproto_client.exceptions import BadRequestError
+
+    try:
+        client.com.atproto.repo.get_record(
+            {"repo": account_did(client), "collection": "app.bsky.feed.post", "rkey": rkey})
+        return True
+    except BadRequestError as e:
+        if getattr(getattr(e.response, "content", None), "error", None) == "RecordNotFound":
+            return False
+        raise
+
+
+class Rejected(Exception):
+    """Bluesky refused this post itself (e.g. too long or too big), so retrying won't help."""
+
+
+def send_post(client, image, size, text, alt, rkey, created_at):
+    """Post the image with the given record key; return the post's URI.
 
     Creating the post is the one step that isn't safe to simply retry: it may have
     gone through even though the reply didn't arrive. With a fixed key, a retry
-    (in this run or a later one) first checks whether that post already exists.
+    first checks whether that post already exists.
     """
     from atproto import models
-    from atproto_client.exceptions import BadRequestError
+    from atproto_client.exceptions import RequestErrorBase
 
-    client = with_retries("logging in", bluesky_client)
-    did = client._session.did
+    did = account_did(client)
     uri = f"at://{did}/app.bsky.feed.post/{rkey}"
+    try:
+        blob = with_retries("uploading the image", lambda: client.upload_blob(image).blob)
+        record = models.AppBskyFeedPost.Record(
+            created_at=created_at, text=text, langs=["en"],
+            embed=models.AppBskyEmbedImages.Main(images=[models.AppBskyEmbedImages.Image(
+                alt=alt, image=blob,
+                aspect_ratio=models.AppBskyEmbedDefs.AspectRatio(width=size[0], height=size[1]))]),
+        )
+        tried = False
 
-    def exists():
-        try:
-            client.com.atproto.repo.get_record({"repo": did, "collection": "app.bsky.feed.post", "rkey": rkey})
-            return True
-        except BadRequestError:  # RecordNotFound
-            return False
+        def create():
+            nonlocal tried
+            if tried and post_exists(client, rkey):  # did the attempt that timed out work?
+                return uri
+            tried = True
+            return client.app.bsky.feed.post.create(did, record, rkey=rkey).uri
 
-    if with_retries("checking for an earlier attempt", exists):
-        print("That post already went through on an earlier attempt.")
-        return uri
-    blob = with_retries("uploading the image", lambda: client.upload_blob(image).blob)
-    record = models.AppBskyFeedPost.Record(
-        created_at=created_at, text=text, langs=["en"],
-        embed=models.AppBskyEmbedImages.Main(images=[models.AppBskyEmbedImages.Image(
-            alt=alt, image=blob,
-            aspect_ratio=models.AppBskyEmbedDefs.AspectRatio(width=size[0], height=size[1]))]),
-    )
-    first = [True]
+        return with_retries("posting", create)
+    except RequestErrorBase as e:
+        if status_of(e) in (400, 413):
+            raise Rejected(f"{type(e).__name__} {status_of(e)}: {getattr(e.response, 'content', '')}") from e
+        raise
 
-    def create():
-        if not first[0] and exists():  # a timed-out attempt may have worked
-            return uri
-        first[0] = False
-        return client.app.bsky.feed.post.create(did, record, rkey=rkey).uri
 
-    return with_retries("posting", create)
+def set_pending(db, pending):
+    with db:
+        if pending:
+            db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pending_post', ?)", (json.dumps(pending),))
+        else:
+            db.execute("DELETE FROM meta WHERE key = 'pending_post'")
+
+
+def record_post(db, path, uri, when):
+    with db:
+        db.execute("UPDATE shots SET post_count = post_count + 1, last_posted_at = ?, post_uri = ? WHERE path = ?",
+                   (when, uri, path))
+        db.execute("DELETE FROM meta WHERE key = 'pending_post'")
 
 
 def post(db, dry_run, day, save=None):
-    """Post the next shot. The shot and the post's record key are saved first, so if
-    posting fails the next run finishes that post (without duplicating it) before
-    picking another."""
+    """Post the next shot.
+
+    The shot and the post's record key are saved before posting. If a run fails,
+    the next one first checks whether that post went through anyway (and records
+    it), and otherwise posts the same shot with the same key, so nothing is posted
+    twice. A post Bluesky refuses outright is dropped and its shot skipped.
+    """
     pending = db.execute("SELECT value FROM meta WHERE key = 'pending_post'").fetchone()
     pending = json.loads(pending[0]) if pending else None
-    shot = pending and db.execute("SELECT * FROM shots WHERE path = ?", (pending["path"],)).fetchone()
-    if shot:
-        print(f"Finishing the post that didn't complete last time ({pending['rkey']}).")
-    else:
+    client = None
+    shot = None
+    if pending and not dry_run:
+        client = with_retries("logging in", bluesky_client)
+        shot = db.execute("SELECT * FROM shots WHERE path = ?", (pending["path"],)).fetchone()
+        if with_retries("checking the unfinished post", lambda: post_exists(client, pending["rkey"])):
+            uri = f"at://{account_did(client)}/app.bsky.feed.post/{pending['rkey']}"
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+            record_post(db, pending["path"], uri, pending.get("tried_at", now))
+            print(f"The unfinished post went through after all: {uri}")
+            return
+        if not shot or shot["skip"]:
+            print("Dropping the unfinished post: its shot is no longer in the database, or is skipped.")
+            set_pending(db, None)
+            pending, shot = None, None
+        else:
+            print(f"Finishing the post that didn't complete last time ({pending['rkey']}).")
+    if not shot:
         pending = None
         shot = pick(db, day)
     if not shot:
@@ -527,26 +595,32 @@ def post(db, dry_run, day, save=None):
             else "subtitle burned in")
     print(f"{shot['path']} ({kind}, uploading {width}x{height} {len(image) // 1024} KB, "
           f"posted {shot['post_count']}x before)")
-    print(f"text: {text!r}\nalt:  {alt!r}", flush=True)
+    print(f"text: {text!r}\nalt:  {alt!r}")
     if save:
         Path(save).write_bytes(image)
         print(f"saved {save}")
     if dry_run:
         return
 
-    if not pending:
-        now = datetime.datetime.now(datetime.timezone.utc)
-        pending = {"path": shot["path"], "rkey": new_tid(),
-                   "created_at": now.isoformat(timespec="milliseconds").replace("+00:00", "Z")}
+    # Posted now, whenever the shot was first tried, so it isn't backdated in feeds.
+    now = datetime.datetime.now(datetime.timezone.utc)
+    created_at = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    pending = {"path": shot["path"], "rkey": pending["rkey"] if pending else new_tid(), "tried_at": created_at}
+    set_pending(db, pending)
+    try:
+        client = client or with_retries("logging in", bluesky_client)
+        uri = send_post(client, image, (width, height), text, alt, pending["rkey"], created_at)
+    except Rejected as e:
         with db:
-            db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pending_post', ?)", (json.dumps(pending),))
-    uri = send_post(shot, image, (width, height), text, alt, pending["rkey"], pending["created_at"])
-    with db:
-        db.execute(
-            "UPDATE shots SET post_count = post_count + 1, last_posted_at = ?, post_uri = ? WHERE path = ?",
-            (pending["created_at"], uri, shot["path"]),
-        )
-        db.execute("DELETE FROM meta WHERE key = 'pending_post'")
+            db.execute("UPDATE shots SET skip = 1 WHERE path = ?", (shot["path"],))
+        set_pending(db, None)
+        sys.exit(f"Bluesky refused this post, so its shot is now skipped: {e}")
+    except Exception as e:
+        if is_transient(e):
+            print(f"Bluesky still isn't responding ({type(e).__name__}); the next run will finish this post.")
+            sys.exit(TRY_AGAIN_LATER)
+        raise
+    record_post(db, shot["path"], uri, created_at)
     print(f"posted {uri}")
 
 
