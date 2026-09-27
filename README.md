@@ -64,6 +64,11 @@ python3 iplayer_urls.py                                   # episode list -> ipla
 caffeinate -i .venv/bin/python iplayer_shots.py --reverse # download + screenshot, newest first -> output/
 ```
 
+To add single episodes, e.g. classic ones missing from the library, put their
+iPlayer URLs in `iplayer_extra.txt` and re-run `iplayer_urls.py`. Classic episodes
+go in the folder `batch_shots.py` would use (matched via `episodes.csv`) and are
+cropped to 4:3, as iPlayer pillarboxes them.
+
 Each subtitle gets a *clean* frame (`cNNNN_HH-MM-SS.mmm.jpg`, no subtitle burned in,
 up to 720p, JPEG quality 85). The subtitle itself goes in `subtitles.csv` (shot,
 start, end, text, segments), where `segments` keeps iPlayer's speaker colours, and

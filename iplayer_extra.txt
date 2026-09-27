@@ -1,0 +1,6 @@
+# Extra iPlayer episodes for iplayer_urls.py to add to iplayer_episodes.csv,
+# one URL per line. Classic episodes go in the folder batch_shots.py would use.
+
+# The Daleks' Master Plan parts 1 and 3: the library copies have no subtitles.
+https://www.bbc.co.uk/iplayer/episode/p00v250v/doctor-who-19631996-season-3-the-daleks-master-plan-the-nightmare-begins
+https://www.bbc.co.uk/iplayer/episode/p00v252r/doctor-who-19631996-season-3-the-daleks-master-plan-devils-planet

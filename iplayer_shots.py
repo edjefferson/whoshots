@@ -22,7 +22,10 @@ Each episode folder gets:
                              each a list of [text, "#rrggbb"] runs
 
 Specials go in the series iPlayer lists them under, numbered on from its last
-episode. Finished episodes are skipped, so it can be stopped and re-run.
+episode. Classic episodes (added by URL in iplayer_extra.txt) go in the folder
+batch_shots.py uses for them, e.g. "Season 03/10 - The Daleks' Master Plan,
+Part 1", and their frames are cropped to 4:3, as iPlayer pillarboxes them.
+Finished episodes are skipped, so it can be stopped and re-run.
 Episodes screenshotted the old way (subtitles burned in, no .clean marker) are
 redone: their old files are removed first.
 """
@@ -48,6 +51,7 @@ DONE_MARKER = ".done"    # written once an episode's screenshots are complete
 CLEAN_MARKER = ".clean"  # ...and this one if they're clean frames (subtitles not burned in)
 JPEG_QUALITY = 85
 PROGRAMMES = {"Doctor Who": "Doctor Who (2023–)"}
+CLASSIC = "Doctor Who (1963–1996)"
 NUMBERED = re.compile(r"(?:.*: )?(\d+)\. (.+)")
 
 
@@ -75,6 +79,45 @@ def episode_dirs(rows):
             number, title = last.get(key, 0) + 1, re.sub(r"^.*Special: ", "", row["episode"])
         last[key] = number
         dirs[row["pid"]] = Path(programme, series, f"{number:02d} - {safe(title)}")
+    return dirs
+
+
+def fold(text):
+    """For matching names: lower case, straight apostrophes, single spaces."""
+    return re.sub(r"\s+", " ", text.replace("’", "'").replace("‘", "'")).strip().lower()
+
+
+def classic_dirs(rows):
+    """Map classic iPlayer episodes to the folders batch_shots.py uses for them.
+
+    iPlayer calls them e.g. "Season 3: The Daleks' Master Plan: The Nightmare
+    Begins" or "Season 7: Spearhead from Space: Episode 1"; they're matched to
+    episodes.csv by season, story and part title or number. Unmatched ones are
+    left out, with a warning.
+    """
+    import batch_shots
+
+    with open(HERE / "episodes.csv", newline="", encoding="utf-8") as f:
+        library = list(csv.DictReader(f))
+    by_title, by_number = {}, {}
+    for r, d in zip(library, batch_shots.episode_dirs(library)):
+        if r["part"].isdigit():
+            story = (int(r["season"]), fold(r["serial"]))
+            by_number[(*story, int(r["part"]))] = d
+            if r["title"]:
+                by_title[(*story, fold(r["title"]))] = d
+    dirs = {}
+    for row in rows:
+        m = re.fullmatch(r"Season (\d+): (.+): (.+)", row["episode"])
+        d = None
+        if m:
+            story = (int(m[1]), fold(m[2]))
+            part = re.fullmatch(r"(?:part|episode) (\d+)", fold(m[3]))
+            d = by_number.get((*story, int(part[1]))) if part else by_title.get((*story, fold(m[3])))
+        if d:
+            dirs[row["pid"]] = d
+        else:
+            print(f"Can't match {row['episode']!r} to episodes.csv; skipping it.", file=sys.stderr)
     return dirs
 
 
@@ -328,8 +371,12 @@ def clear_episode(shots_dir):
             p.unlink()
 
 
-def shoot(video, subs, shots_dir, max_height, jobs, keep_video, status, label):
-    """Save a clean frame for every cue plus the subtitle files; return how many frames."""
+def shoot(video, subs, shots_dir, max_height, jobs, keep_video, status, label, aspect=None):
+    """Save a clean frame for every cue plus the subtitle files; return how many frames.
+
+    With aspect (e.g. 4/3), frames wider than that are cropped to it, centred:
+    iPlayer shows classic episodes pillarboxed in a 16:9 frame.
+    """
     import subshots
 
     subshots.MAX_HEIGHT = max_height or None
@@ -346,6 +393,10 @@ def shoot(video, subs, shots_dir, max_height, jobs, keep_video, status, label):
     def grab(i, cue, tmp):
         c = subshots.Cue(cue["start"], cue["end"])
         t, img = subshots.grab_sharpest(video, c, 0.4, False, Path(tmp) / f"{i:04d}")
+        if aspect and img.width > img.height * aspect + 1:
+            w = round(img.height * aspect)
+            left = (img.width - w) // 2
+            img = img.crop((left, 0, left + w, img.height))
         name = f"c{i:04d}_{subshots.timestamp(t)}.jpg"
         img.save(shots_dir / name, quality=JPEG_QUALITY)
         return name
@@ -402,7 +453,10 @@ def main():
 
     with open(args.csv, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    dirs = episode_dirs(rows)  # before filtering, as specials are numbered from the episodes before them
+    # Before filtering, as specials are numbered from the episodes before them.
+    dirs = episode_dirs([r for r in rows if r["programme"] != CLASSIC])
+    dirs.update(classic_dirs([r for r in rows if r["programme"] == CLASSIC]))
+    rows = [r for r in rows if r["pid"] in dirs]
     if args.match:
         pattern = re.compile(args.match, re.I)
         rows = [r for r in rows if pattern.search(f"{r['programme']} {r['episode']}")]
@@ -432,7 +486,8 @@ def main():
     def shoot_and_report(name, started, video, subs):
         shots_start = time.monotonic()
         count = shoot(video, subs, args.output / name, args.max_height, args.jobs,
-                      args.keep_video, status, label=short(name))
+                      args.keep_video, status, label=short(name),
+                      aspect=4 / 3 if name.parts[0] == CLASSIC else None)
         status.log(f"✓ {name}  {count} shots  (download {duration(shots_start - started)}, "
                    f"shots {duration(time.monotonic() - shots_start)})", done=True)
 
