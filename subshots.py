@@ -233,7 +233,7 @@ def save_image(img, out):
     img.save(out, **({"quality": 80} if out.suffix.lower() in (".jpg", ".jpeg") else {}))
 
 
-def render_bitmap_subs(video, track, workdir):
+def render_bitmap_subs(video, track, workdir, until=None):
     """Render every image of a bitmap subtitle track, in one pass; return
     {time shown: png path}, times in the video's own timestamps.
 
@@ -248,8 +248,9 @@ def render_bitmap_subs(video, track, workdir):
     # -copyts keeps the original timestamps; otherwise ffmpeg starts the copy at 0.
     run(["ffmpeg", "-v", "error", "-y", "-copyts", "-i", str(video), "-map", f"0:s:{track}",
          "-c", "copy", "-f", "matroska", str(track_file)])
+    stop = ["-to", f"{until:.3f}"] if until else []  # e.g. with --limit, no need to render the rest
     proc = run(["ffmpeg", "-hide_banner", "-y", "-copyts", "-i", str(track_file),
-                "-filter_complex", "[0:s:0]format=rgba,showinfo[s]", "-map", "[s]",
+                "-filter_complex", "[0:s:0]format=rgba,showinfo[s]", "-map", "[s]", *stop,
                 "-fps_mode", "passthrough", str(workdir / "s%05d.png")])
     images = {}
     # ffmpeg writes the old picture just before each change and the new one at it,
@@ -269,24 +270,51 @@ def bitmap_sub_image(images, cue, start_time):
     return images[max(shown)]
 
 
-def composite_subtitle(frame, sub_png, video_size):
-    """Draw a bitmap subtitle onto a frame. The subtitle canvas is centred on the
-    video, as rips are often cropped while the canvas keeps the original frame
-    size (e.g. 1920x1080 PGS over a 1432x1070 pillarbox crop), then scaled the
-    same way the frame was (e.g. anamorphic DVD video to square pixels)."""
+def place_subtitle(frame_size, sub_png, video_size):
+    """The visible part of a bitmap subtitle, scaled to a frame, and where on the
+    frame it goes: (image, (x, y)), or None if nothing is visible.
+
+    The subtitle canvas is centred on the video, as rips are often cropped while
+    the canvas keeps the original frame size (e.g. 1920x1080 PGS over a 1432x1070
+    pillarbox crop), then scaled the same way the frame was (e.g. anamorphic DVD
+    video to square pixels)."""
     from PIL import Image
 
     sub = Image.open(sub_png).convert("RGBA")
     bbox = sub.getchannel("A").getbbox()
     if not bbox:
-        return
+        return None
     video_w, video_h = video_size
-    sx, sy = frame.width / video_w, frame.height / video_h
+    sx, sy = frame_size[0] / video_w, frame_size[1] / video_h
     x0 = (video_w - sub.width) / 2 + bbox[0]
     y0 = (video_h - sub.height) / 2 + bbox[1]
     piece = sub.crop(bbox)
     piece = piece.resize((max(1, round(piece.width * sx)), max(1, round(piece.height * sy))), Image.LANCZOS)
-    frame.paste(piece, (round(x0 * sx), round(y0 * sy)), piece)
+    return piece, (round(x0 * sx), round(y0 * sy))
+
+
+def composite_subtitle(frame, sub_png, video_size):
+    """Draw a bitmap subtitle onto a frame (see place_subtitle)."""
+    placed = place_subtitle(frame.size, sub_png, video_size)
+    if placed:
+        piece, position = placed
+        frame.paste(piece, position, piece)
+
+
+def crop_to_aspect(img, aspect):
+    """Crop a frame to aspect (width/height), centred, if it's wider, e.g. to take
+    the pillarbox bars off 4:3 video in a 16:9 frame. Returns (image, pixels
+    cropped from the left)."""
+    if not aspect or img.width <= img.height * aspect + 1:
+        return img, 0
+    width = round(img.height * aspect)
+    left = (img.width - width) // 2
+    return img.crop((left, 0, left + width, img.height)), left
+
+
+def parse_aspect(value):
+    w, _, h = value.partition(":")
+    return float(w) / float(h) if h else float(w)
 
 
 def sharpest_frame_time(video, cue, window, start_time, deinterlace):
@@ -421,10 +449,12 @@ def fix_ocr(line):
     return line
 
 
-def save_subtitles(out_dir, results):
+def save_subtitles(out_dir, results, overlays=None):
     """Write subtitles.srt, and subtitles.csv saying which line each shot shows.
 
-    results: (cue, shot filename or None, text) in cue order.
+    results: (cue, shot filename or None, text) in cue order. overlays: for
+    --separate-subs, {shot filename: (subtitle image filename, x, y)}, which adds
+    sub_image and sub_pos columns.
     """
     import pysubs2
 
@@ -436,9 +466,13 @@ def save_subtitles(out_dir, results):
     srt.save(str(out_dir / "subtitles.srt"))
     with open(out_dir / "subtitles.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["shot", "start", "end", "text"])
+        writer.writerow(["shot", "start", "end", "text"] + (["sub_image", "sub_pos"] if overlays is not None else []))
         for cue, shot, text in results:
-            writer.writerow([shot or "", f"{cue.start:.3f}", f"{cue.end:.3f}", text])
+            row = [shot or "", f"{cue.start:.3f}", f"{cue.end:.3f}", text]
+            if overlays is not None:
+                sub_image, x, y = overlays.get(shot) or ("", None, None)
+                row += [sub_image, f"{x},{y}" if sub_image else ""]
+            writer.writerow(row)
 
 
 def find_font(explicit):
@@ -526,6 +560,13 @@ def build_parser():
     ap.add_argument("--hwaccel", default="auto",
                     help="ffmpeg hardware decoder, e.g. videotoolbox, or 'none' "
                          "(default: auto = videotoolbox for HEVC video on macOS)")
+    ap.add_argument("--separate-subs", action="store_true",
+                    help="bitmap subtitles: save each frame clean (cNNNN_...jpg) with its subtitle as a "
+                         "separate transparent image (cNNNN_....sub.png) to paste on later, instead of "
+                         "burning it in; needs --save-subs")
+    ap.add_argument("--aspect", type=parse_aspect,
+                    help="crop frames wider than this to it, centred, e.g. 4:3 to remove pillarbox bars "
+                         "(not with the libass renderer)")
     ap.add_argument("--save-subs", action="store_true",
                     help="also write subtitles.srt and subtitles.csv (shot, start, end, text) to the "
                          "output folder; bitmap subtitles are read with tesseract OCR")
@@ -604,11 +645,15 @@ def main():
         if not cues:
             sys.exit("No subtitle cues found.")
 
+        if args.separate_subs and (renderer != "bitmap" or not args.save_subs):
+            sys.exit("--separate-subs is for bitmap subtitles and needs --save-subs "
+                     "(the CSV records which subtitle image goes with which frame).")
         if args.save_subs and renderer == "bitmap" and not shutil.which("tesseract"):
             sys.exit("--save-subs needs tesseract to read bitmap subtitles (brew install tesseract).")
         if renderer == "bitmap":
             print("Rendering subtitle images...", flush=True)
-            sub_images = render_bitmap_subs(args.video, args.track, tmp / "subs")
+            sub_images = render_bitmap_subs(args.video, args.track, tmp / "subs",
+                                            until=cues[-1].end + start_time + 1 if args.limit else None)
             video_size = (video_stream["width"], video_stream["height"])
 
         def shoot(i, cue):
@@ -622,6 +667,7 @@ def main():
             t, img = grab_sharpest(args.video, cue, args.window, args.deinterlace, tmp / f"frames{i:04d}")
             out = out_dir / f"{i:04d}_{timestamp(t)}.{args.format}"
             if renderer != "bitmap":
+                img, _ = crop_to_aspect(img, args.aspect)
                 draw_subtitle(img, cue.text, font_path, args.font_scale)
                 save_image(img, out)
                 return out.name, cue.text
@@ -632,11 +678,24 @@ def main():
                 if not prepare_for_ocr(sub_png, text):
                     # A subtitle with nothing visible (a glitch on some discs): no screenshot.
                     return None, ""
+            if args.separate_subs:
+                placed = place_subtitle(img.size, sub_png, video_size)
+                img, left = crop_to_aspect(img, args.aspect)
+                out = out_dir / f"c{i:04d}_{timestamp(t)}.{args.format}"
+                save_image(img, out)
+                if placed:
+                    piece, (x, y) = placed
+                    sub_name = f"{out.stem}.sub.png"
+                    piece.save(out_dir / sub_name)
+                    overlays[out.name] = (sub_name, x - left, y)
+                return out.name, text
             composite_subtitle(img, sub_png, video_size)
+            img, _ = crop_to_aspect(img, args.aspect)
             save_image(img, out)
             return out.name, text
 
         print(f"{len(cues)} cues, renderer: {renderer}, output: {out_dir}")
+        overlays = {}  # shot name -> (subtitle image, x, y), with --separate-subs
         failures = 0
         results = {}
         with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
@@ -657,7 +716,8 @@ def main():
                     results[i] = (results[i][0], text)
             blank = "" if renderer == "bitmap" else None
             save_subtitles(out_dir, [(c, *results.get(i, (None, c.text if blank is None else blank)))
-                                     for i, c in enumerate(cues, 1)])
+                                     for i, c in enumerate(cues, 1)],
+                           overlays if args.separate_subs else None)
         if failures:
             sys.exit(f"{failures} screenshot(s) failed.")
 

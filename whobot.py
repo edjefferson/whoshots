@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS shots (
     end REAL,
     text TEXT,
     segments TEXT,                -- JSON lines of [text, colour] runs if the subtitle isn't burned in
+    overlay TEXT,                 -- JSON {image, x, y}: a subtitle image to paste on, if kept separately
     tag TEXT,                     -- christmas, new_year or NULL
     skip INTEGER NOT NULL DEFAULT 0,
     post_count INTEGER NOT NULL DEFAULT 0,
@@ -136,9 +137,11 @@ def connect():
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
     db.executescript(SCHEMA)
-    # Databases made before clean frames existed lack this column.
-    if "segments" not in {row[1] for row in db.execute("PRAGMA table_info(shots)")}:
-        db.execute("ALTER TABLE shots ADD COLUMN segments TEXT")
+    # Databases made before these existed lack the columns.
+    columns = {row[1] for row in db.execute("PRAGMA table_info(shots)")}
+    for column in ("segments", "overlay"):
+        if column not in columns:
+            db.execute(f"ALTER TABLE shots ADD COLUMN {column} TEXT")
     return db
 
 
@@ -179,6 +182,14 @@ def status_line(text):
     width = shutil.get_terminal_size().columns
     sys.stdout.write("\r\033[K" + (text if len(text) < width else text[: width - 2] + "…"))
     sys.stdout.flush()
+
+
+def overlay_json(rel_dir, row):
+    """The overlay column for a CSV row with a separate subtitle image, else None."""
+    if not row.get("sub_image"):
+        return None
+    x, y = (int(v) for v in row["sub_pos"].split(","))
+    return json.dumps({"image": (rel_dir / row["sub_image"]).as_posix(), "x": x, "y": y})
 
 
 def remove_old_shots(db, dir, keep):
@@ -226,20 +237,23 @@ def build_db(db, shots_dir, full=False):
                 rows = [r for r in csv.DictReader(f) if r["shot"]]
             shot_paths = [(rel_dir / r["shot"]).as_posix() for r in rows]
             db.executemany("""
-                INSERT INTO shots (path, dir, programme, series, episode, title, start, end, text, segments)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO shots (path, dir, programme, series, episode, title, start, end, text, segments, overlay)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path) DO UPDATE SET
                     dir = excluded.dir, programme = excluded.programme, series = excluded.series,
                     episode = excluded.episode, title = excluded.title, start = excluded.start,
-                    end = excluded.end, text = excluded.text, segments = excluded.segments
+                    end = excluded.end, text = excluded.text, segments = excluded.segments,
+                    overlay = excluded.overlay
                 -- Only rewrite rows that actually changed.
                 WHERE (shots.dir, shots.programme, shots.series, shots.episode, shots.title,
-                       shots.start, shots.end, shots.text, shots.segments)
+                       shots.start, shots.end, shots.text, shots.segments, shots.overlay)
                     IS NOT (excluded.dir, excluded.programme, excluded.series, excluded.episode,
-                            excluded.title, excluded.start, excluded.end, excluded.text, excluded.segments)
+                            excluded.title, excluded.start, excluded.end, excluded.text, excluded.segments,
+                            excluded.overlay)
             """, [
                 (p, rel_dir.as_posix(), programme, series, number, title,
-                 float(r["start"]), float(r["end"]), r["text"], r.get("segments") or None)
+                 float(r["start"]), float(r["end"]), r["text"], r.get("segments") or None,
+                 overlay_json(rel_dir, r))
                 for p, r in zip(shot_paths, rows)
             ])
             removed += remove_old_shots(db, rel_dir.as_posix(), shot_paths)
@@ -356,8 +370,19 @@ def prepare_image(shot, data):
 
     img = Image.open(io.BytesIO(data)).convert("RGB")
     upload_width = int(os.environ["UPLOAD_WIDTH"] or 0)
-    if upload_width and img.width < upload_width:
-        img = img.resize((upload_width, round(img.height * upload_width / img.width)), Image.LANCZOS)
+    scale = upload_width / img.width if upload_width and img.width < upload_width else 1
+    if scale != 1:
+        img = img.resize((upload_width, round(img.height * scale)), Image.LANCZOS)
+    if shot["overlay"]:
+        # A disc subtitle kept as an image: scaled like the frame, and kept inside
+        # it (it may have run into pillarbox bars that were cropped off).
+        overlay = json.loads(shot["overlay"])
+        sub = Image.open(io.BytesIO(load_image(overlay["image"]))).convert("RGBA")
+        if scale != 1:
+            sub = sub.resize((round(sub.width * scale), round(sub.height * scale)), Image.LANCZOS)
+        x = min(max(round(overlay["x"] * scale), 0), max(img.width - sub.width, 0))
+        y = min(max(round(overlay["y"] * scale), 0), max(img.height - sub.height, 0))
+        img.paste(sub, (x, y), sub)
     if shot["segments"]:
         # Drawn after scaling up, so the text is sharp at full size.
         draw_subtitles(img, json.loads(shot["segments"]))
@@ -376,7 +401,8 @@ def post(db, dry_run, day, save=None):
     text = render(os.environ["POST_TEXT"], shot)
     alt = render(os.environ["ALT_TEXT"], shot)
     image, (width, height) = prepare_image(shot, load_image(shot["path"]))
-    kind = "subtitle drawn on" if shot["segments"] else "subtitle burned in"
+    kind = ("subtitle drawn on" if shot["segments"] else "subtitle image pasted on" if shot["overlay"]
+            else "subtitle burned in")
     print(f"{shot['path']} ({kind}, uploading {width}x{height} {len(image) // 1024} KB, "
           f"posted {shot['post_count']}x before)")
     print(f"text: {text!r}\nalt:  {alt!r}")
@@ -411,6 +437,7 @@ def prune_images(db, delete):
         sys.exit("prune-images only works on a local IMAGES_DIR.")
     root = Path(os.environ["IMAGES_DIR"])
     used = {p for (p,) in db.execute("SELECT path FROM shots")}
+    used |= {json.loads(o)["image"] for (o,) in db.execute("SELECT overlay FROM shots WHERE overlay IS NOT NULL")}
     unused = []
     for (d,) in db.execute("SELECT DISTINCT dir FROM shots ORDER BY dir"):
         folder = root / d
@@ -438,8 +465,9 @@ def stats(db):
     episodes = db.execute("SELECT count(DISTINCT dir) FROM shots").fetchone()[0]
     print(f"{total} shots from {episodes} episodes, {posted or 0} posted at least once, "
           f"everything posted at least {lowest or 0}x")
-    clean = db.execute("SELECT count(*) FROM shots WHERE segments IS NOT NULL").fetchone()[0]
-    print(f"  {clean} with the subtitle drawn on when posting, {total - clean} burned in")
+    drawn, pasted = db.execute("SELECT count(segments), count(overlay) FROM shots WHERE skip = 0").fetchone()
+    print(f"  {drawn} with the subtitle drawn on when posting, {pasted} with a subtitle image pasted on, "
+          f"{total - drawn - pasted} burned in")
     for tag, count in db.execute("SELECT tag, count(*) FROM shots WHERE tag IS NOT NULL GROUP BY tag"):
         print(f"  {tag}: {count} shots")
     skipped = db.execute("SELECT count(*) FROM shots WHERE skip = 1").fetchone()[0]
