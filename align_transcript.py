@@ -87,8 +87,18 @@ def chunks(text):
     return pieces
 
 
+UNITS = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen " \
+        "sixteen seventeen eighteen nineteen".split()
+TENS = "twenty thirty forty fifty sixty seventy eighty ninety".split()
+# Number words as digits, as the captions write "3 2 1" where the transcript has "Three... two... one...".
+NUMBERS = {w: str(n) for n, w in enumerate(UNITS)}
+NUMBERS.update({t: str(20 + 10 * i) for i, t in enumerate(TENS)})
+NUMBERS.update({t + u: str(20 + 10 * i + n) for i, t in enumerate(TENS) for n, u in enumerate(UNITS[1:10], 1)})
+
+
 def norm(word):
-    return re.sub(r"[^a-z0-9]", "", word.lower())
+    word = re.sub(r"[^a-z0-9]", "", word.lower())
+    return NUMBERS.get(word, word)
 
 
 def caption_words(path):
@@ -129,6 +139,15 @@ def align(transcript, captions):
     for i, (speaker, piece) in enumerate(subs):
         idx = [k for k, (j, _) in enumerate(t_words) if j == i]
         hits = [matched[k] for k in idx if k in matched]
+        # A common word can match one said much later (e.g. "of" in a closing link),
+        # so keep the biggest cluster of matches without long gaps.
+        if hits:
+            groups = [[hits[0]]]
+            for h in hits[1:]:
+                if captions[h][0] - captions[groups[-1][-1]][0] > 3:
+                    groups.append([])
+                groups[-1].append(h)
+            hits = max(groups, key=len)
         start = end = None
         if hits:
             start = captions[hits[0]][0]
@@ -139,7 +158,10 @@ def align(transcript, captions):
         rows.append({"speaker": speaker, "text": piece, "start": start, "end": end,
                      "match": len(hits) / len(idx) if idx else 0})
 
-    # Fit unmatched lines between their neighbours, in proportion to their length.
+    # Fit unmatched lines in between their neighbours: each gets an estimated
+    # duration from its length, placed just before the next matched line (a short
+    # line the captions missed, "Brigadier!", usually comes right before the reply),
+    # or, without that much room, a share of the gap in proportion to its length.
     i = 0
     while i < len(rows):
         if rows[i]["start"] is not None:
@@ -149,12 +171,13 @@ def align(transcript, captions):
         while j < len(rows) and rows[j]["start"] is None:
             j += 1
         lo = rows[i - 1]["end"] if i else 0.0
-        hi = rows[j]["start"] if j < len(rows) else lo + 3 * (j - i)
-        total = sum(len(r["text"]) for r in rows[i:j]) or 1
-        t = lo
-        for r in rows[i:j]:
+        hi = rows[j]["start"] - 0.04 if j < len(rows) else lo + 3 * (j - i)
+        wanted = [min(max(0.7 + 0.065 * len(r["text"]), 1.0), 5.0) for r in rows[i:j]]
+        scale = min(1.0, (hi - lo) / sum(wanted))
+        t = hi - sum(wanted) * scale
+        for r, d in zip(rows[i:j], wanted):
             r["start"] = t
-            t += (hi - lo) * len(r["text"]) / total
+            t += d * scale
             r["end"] = t
         i = j
 
