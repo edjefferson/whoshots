@@ -23,10 +23,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from iplayer_shots import DONE_MARKER, SHOT_EXTS, Status, duration, safe, stream
+from iplayer_shots import CLEAN_MARKER, DONE_MARKER, SHOT_EXTS, Status, duration, safe, stream
 
 HERE = Path(__file__).parent
 PROGRAMME = "Doctor Who (1963–1996)"
+# Written with DONE_MARKER when the subtitles were kept separate from the frames
+# (subshots.py --separate-subs), so episodes done the old burned-in way get redone.
+SEPARATE_MARKER = ".separate"
+# Classic episodes are 4:3; frames wider than that (pillarboxed) are cropped.
+SEPARATE_ARGS = ["--separate-subs", "--aspect", "4:3"]
 COPY_CHUNK = 8 * 1024 * 1024
 
 
@@ -112,7 +117,13 @@ def copy(src, dest, status, label):
     return dest
 
 
-def shoot(video, row, shots_dir, extra_args, status, label):
+def is_done(shots_dir, separate):
+    if separate:  # clean frames, from here or from iplayer_shots.py
+        return (shots_dir / SEPARATE_MARKER).exists() or (shots_dir / CLEAN_MARKER).exists()
+    return (shots_dir / DONE_MARKER).exists()
+
+
+def shoot(video, row, shots_dir, extra_args, status, label, separate=True):
     """Screenshot every cue; return how many screenshots were taken."""
     import re
 
@@ -128,7 +139,7 @@ def shoot(video, row, shots_dir, extra_args, status, label):
     try:
         failed = stream([
             sys.executable, "-u", str(HERE / "subshots.py"), str(video), "-o", str(shots_dir),
-            "-t", row["subs_track"], "--save-subs", *extra_args,
+            "-t", row["subs_track"], "--save-subs", *(SEPARATE_ARGS if separate else []), *extra_args,
         ], on_line)
     finally:
         status.set("shoot")
@@ -136,6 +147,8 @@ def shoot(video, row, shots_dir, extra_args, status, label):
     for line in failed:  # individual cues that failed, which subshots.py reports but carries on past
         status.log(f"    {line}")
     (shots_dir / DONE_MARKER).touch()
+    if separate:
+        (shots_dir / SEPARATE_MARKER).touch()
     return sum(p.suffix in SHOT_EXTS for p in shots_dir.iterdir())
 
 
@@ -156,6 +169,9 @@ def main():
     ap.add_argument("--shuffle", action="store_true",
                     help="go through episodes in random order (default: broadcast order)")
     ap.add_argument("--dry-run", action="store_true", help="list what would be done")
+    ap.add_argument("--burn", action="store_true",
+                    help="burn subtitles into the frames, as before, instead of keeping them separate "
+                         "(clean frames with the subtitle as an image or text, put on when posting)")
     args, subshots_args = ap.parse_known_args()
     # Check options meant for subshots.py now, rather than failing on every episode.
     from subshots import build_parser
@@ -182,7 +198,7 @@ def main():
             if not args.quiet:
                 print(f"Skipping {short(dirs[id(r)])}: {why}")
     rows = [r for r in rows if r["file"] and r["has_subs"] == "yes"]
-    todo = [r for r in rows if not (args.output / dirs[id(r)] / DONE_MARKER).exists()]
+    todo = [r for r in rows if not is_done(args.output / dirs[id(r)], not args.burn)]
     if args.shuffle:
         random.shuffle(todo)
         # Episodes an interrupted run started go first, so they get finished.
@@ -211,7 +227,8 @@ def main():
 
     def shoot_and_report(name, started, video, row):
         shots_start = time.monotonic()
-        count = shoot(video, row, args.output / name, subshots_args, status, label=short(name))
+        count = shoot(video, row, args.output / name, subshots_args, status, label=short(name),
+                      separate=not args.burn)
         status.log(f"✓ {name}  {count} shots  (copy {duration(shots_start - started)}, "
                    f"shots {duration(time.monotonic() - shots_start)})", done=True)
 

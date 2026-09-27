@@ -449,12 +449,13 @@ def fix_ocr(line):
     return line
 
 
-def save_subtitles(out_dir, results, overlays=None):
+def save_subtitles(out_dir, results, overlays=None, segments=False):
     """Write subtitles.srt, and subtitles.csv saying which line each shot shows.
 
     results: (cue, shot filename or None, text) in cue order. overlays: for
     --separate-subs, {shot filename: (subtitle image filename, x, y)}, which adds
-    sub_image and sub_pos columns.
+    sub_image and sub_pos columns. segments: add a segments column (the text as
+    white lines, the format iplayer_shots.py uses) so the text can be drawn on later.
     """
     import pysubs2
 
@@ -466,12 +467,16 @@ def save_subtitles(out_dir, results, overlays=None):
     srt.save(str(out_dir / "subtitles.srt"))
     with open(out_dir / "subtitles.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["shot", "start", "end", "text"] + (["sub_image", "sub_pos"] if overlays is not None else []))
+        writer.writerow(["shot", "start", "end", "text"] + (["sub_image", "sub_pos"] if overlays is not None else [])
+                        + (["segments"] if segments else []))
         for cue, shot, text in results:
             row = [shot or "", f"{cue.start:.3f}", f"{cue.end:.3f}", text]
             if overlays is not None:
                 sub_image, x, y = overlays.get(shot) or ("", None, None)
                 row += [sub_image, f"{x},{y}" if sub_image else ""]
+            if segments:
+                lines = [[[line, "#ffffff"]] for line in text.split("\n") if line.strip()] if shot and text else []
+                row.append(json.dumps(lines, ensure_ascii=False) if lines else "")
             writer.writerow(row)
 
 
@@ -561,9 +566,10 @@ def build_parser():
                     help="ffmpeg hardware decoder, e.g. videotoolbox, or 'none' "
                          "(default: auto = videotoolbox for HEVC video on macOS)")
     ap.add_argument("--separate-subs", action="store_true",
-                    help="bitmap subtitles: save each frame clean (cNNNN_...jpg) with its subtitle as a "
-                         "separate transparent image (cNNNN_....sub.png) to paste on later, instead of "
-                         "burning it in; needs --save-subs")
+                    help="save each frame clean (cNNNN_...jpg) instead of burning the subtitle in: "
+                         "bitmap subtitles are kept as separate transparent images (cNNNN_....sub.png) to "
+                         "paste on later, text ones as text (a segments column) to draw on later; "
+                         "needs --save-subs")
     ap.add_argument("--aspect", type=parse_aspect,
                     help="crop frames wider than this to it, centred, e.g. 4:3 to remove pillarbox bars "
                          "(not with the libass renderer)")
@@ -645,9 +651,8 @@ def main():
         if not cues:
             sys.exit("No subtitle cues found.")
 
-        if args.separate_subs and (renderer != "bitmap" or not args.save_subs):
-            sys.exit("--separate-subs is for bitmap subtitles and needs --save-subs "
-                     "(the CSV records which subtitle image goes with which frame).")
+        if args.separate_subs and not args.save_subs:
+            sys.exit("--separate-subs needs --save-subs (the CSV records which subtitle goes with which frame).")
         if args.save_subs and renderer == "bitmap" and not shutil.which("tesseract"):
             sys.exit("--save-subs needs tesseract to read bitmap subtitles (brew install tesseract).")
         if renderer == "bitmap":
@@ -659,7 +664,7 @@ def main():
         def shoot(i, cue):
             """Take the screenshot; return its name and the subtitle's text (for
             bitmap subtitles, the image prepared for OCR, or "" if blank)."""
-            if renderer == "libass":
+            if renderer == "libass" and not args.separate_subs:
                 t = sharpest_frame_time(args.video, cue, args.window, start_time, args.deinterlace)
                 out = out_dir / f"{i:04d}_{timestamp(t)}.{args.format}"
                 render_libass(args.video, t, out, sub_file, fonts_dir, start_time, args.deinterlace)
@@ -668,7 +673,10 @@ def main():
             out = out_dir / f"{i:04d}_{timestamp(t)}.{args.format}"
             if renderer != "bitmap":
                 img, _ = crop_to_aspect(img, args.aspect)
-                draw_subtitle(img, cue.text, font_path, args.font_scale)
+                if args.separate_subs:
+                    out = out_dir / f"c{i:04d}_{timestamp(t)}.{args.format}"
+                else:
+                    draw_subtitle(img, cue.text, font_path, args.font_scale)
                 save_image(img, out)
                 return out.name, cue.text
             sub_png = bitmap_sub_image(sub_images, cue, start_time)
@@ -717,7 +725,8 @@ def main():
             blank = "" if renderer == "bitmap" else None
             save_subtitles(out_dir, [(c, *results.get(i, (None, c.text if blank is None else blank)))
                                      for i, c in enumerate(cues, 1)],
-                           overlays if args.separate_subs else None)
+                           overlays if args.separate_subs and renderer == "bitmap" else None,
+                           segments=args.separate_subs and renderer != "bitmap")
         if failures:
             sys.exit(f"{failures} screenshot(s) failed.")
 
