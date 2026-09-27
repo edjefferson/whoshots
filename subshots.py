@@ -168,34 +168,31 @@ def window_bounds(cue, window):
     return (lo, hi) if window > 0 and hi - lo >= 0.1 else None
 
 
-def grab_sharpest(video, cue, window, deinterlace, workdir, track=None, sub_image=None, tries=3):
-    """Return (time, image) of the sharpest frame near the cue's midpoint.
+def grab_sharpest(video, cue, window, deinterlace, workdir, tries=3):
+    """Return (time, image) of the sharpest frame near the cue's midpoint, without
+    any subtitle (bitmap subtitles are composited on afterwards, see
+    render_bitmap_subs).
 
-    ffmpeg occasionally returns no frames for a window it handles fine on
-    another go (seen overlaying bitmap subtitles, e.g. Time-Flight Part 1), so
-    this retries, and as a last resort takes just the frame at the midpoint.
+    As a safety net, a window that comes back with no frames is retried, and as
+    a last resort just the frame at the midpoint is taken.
     """
     for attempt in range(tries):
         try:
-            return _grab_sharpest(video, cue, window, deinterlace, workdir.with_name(f"{workdir.name}-{attempt}"),
-                                  track, sub_image)
+            return _grab_sharpest(video, cue, window, deinterlace, workdir.with_name(f"{workdir.name}-{attempt}"))
         except RuntimeError as e:
             if "no frames" not in str(e):
                 raise
     if window_bounds(cue, window) is None:
         raise RuntimeError(f"no frames around {cue.mid:.3f}s after {tries} tries")
-    return grab_sharpest(video, cue, 0, deinterlace, workdir.with_name(f"{workdir.name}-mid"),
-                         track, sub_image, tries)
+    return grab_sharpest(video, cue, 0, deinterlace, workdir.with_name(f"{workdir.name}-mid"), tries)
 
 
-def _grab_sharpest(video, cue, window, deinterlace, workdir, track=None, sub_image=None):
+def _grab_sharpest(video, cue, window, deinterlace, workdir):
     """One go at grab_sharpest.
 
     The exact midpoint often lands on a motion-blurred frame; nearby frames can
     be much crisper. One ffmpeg run decodes the window once, writing every
-    frame at output size plus a small greyscale copy of each to score. With
-    track, the bitmap subtitle is overlaid on the frames and, with sub_image,
-    also saved on its own for OCR.
+    frame at output size plus a small greyscale copy of each to score.
     """
     from PIL import Image
 
@@ -206,33 +203,15 @@ def _grab_sharpest(video, cue, window, deinterlace, workdir, track=None, sub_ima
     pre = "bwdif," if deinterlace else ""
     post = ",".join(base_filters(False))
     gray = f"scale={w}:{h},format=gray,showinfo"
-    if track is None:
-        seek = lo
-        inputs = ["-ss", f"{lo:.3f}", "-t", f"{hi - lo:.3f}", *HWACCEL, "-i", str(video)]
-        graph = f"[0:v:0]{pre}{post},split[full][g];[g]{gray}[gray]"
-    else:
-        # Start a little before the cue so its subtitle packet is decoded, then
-        # trim to the window after overlaying it.
-        seek = max(0.0, cue.start - 1)
-        inputs = ["-ss", f"{seek:.3f}", *HWACCEL, "-i", str(video)]
-        trim = f"trim=start={lo - seek:.3f}:end={hi - seek:.3f}"
-        subs = f"[0:s:{track}]"
-        graph = f"[0:v:0]{pre}split[va][vb];"
-        if sub_image:
-            graph += f"{subs}split[s1][s2];[s2]format=rgba[subimg];"
-            subs = "[s1]"
-        # Rips are often cropped while the subtitle canvas keeps the original frame
-        # size (e.g. 1920x1080 PGS over a 1432x1070 pillarbox crop), so centre it.
-        graph += (f"[va]{subs}overlay=x=(W-w)/2:y=(H-h)/2,{trim},{post}[full];"
-                  f"[vb]{trim},{gray}[gray]")
+    seek = lo
+    inputs = ["-ss", f"{lo:.3f}", "-t", f"{hi - lo:.3f}", *HWACCEL, "-i", str(video)]
+    graph = f"[0:v:0]{pre}{post},split[full][g];[g]{gray}[gray]"
     workdir.mkdir()
     cmd = [
         "ffmpeg", "-hide_banner", "-y", *inputs, "-filter_complex", graph,
         "-map", "[full]", "-fps_mode", "passthrough", *single, str(workdir / "f%04d.bmp"),
         "-map", "[gray]", "-fps_mode", "passthrough", *single, "-f", "rawvideo", str(workdir / "gray.raw"),
     ]
-    if sub_image:
-        cmd += ["-map", "[subimg]", "-ss", f"{cue.mid - seek:.3f}", "-frames:v", "1", str(sub_image)]
     try:
         proc = run(cmd)
         times = [float(x) for x in re.findall(r"pts_time:\s*(-?[\d.]+)", proc.stderr.decode())]
@@ -252,6 +231,62 @@ def _grab_sharpest(video, cue, window, deinterlace, workdir, track=None, sub_ima
 
 def save_image(img, out):
     img.save(out, **({"quality": 80} if out.suffix.lower() in (".jpg", ".jpeg") else {}))
+
+
+def render_bitmap_subs(video, track, workdir):
+    """Render every image of a bitmap subtitle track, in one pass; return
+    {time shown: png path}, times in the video's own timestamps.
+
+    Overlaying the subtitle track onto the video in the same ffmpeg run as the
+    frame grab occasionally loses every frame, depending on how the two streams'
+    reads happen to line up. Rendering the subtitle track on its own (after
+    copying it out, so ffmpeg needn't read the video) involves no such timing,
+    and the images are composited onto the frames afterwards.
+    """
+    workdir.mkdir()
+    track_file = workdir / "track.mks"
+    # -copyts keeps the original timestamps; otherwise ffmpeg starts the copy at 0.
+    run(["ffmpeg", "-v", "error", "-y", "-copyts", "-i", str(video), "-map", f"0:s:{track}",
+         "-c", "copy", "-f", "matroska", str(track_file)])
+    proc = run(["ffmpeg", "-hide_banner", "-y", "-copyts", "-i", str(track_file),
+                "-filter_complex", "[0:s:0]format=rgba,showinfo[s]", "-map", "[s]",
+                "-fps_mode", "passthrough", str(workdir / "s%05d.png")])
+    images = {}
+    # ffmpeg writes the old picture just before each change and the new one at it,
+    # so for each time the later frame (the new picture) wins.
+    for n, t in re.findall(r"n:\s*(\d+)\s+pts:\s*-?\d+\s+pts_time:(-?[\d.]+)", proc.stderr.decode()):
+        images[round(float(t), 3)] = workdir / f"s{int(n) + 1:05d}.png"
+    return images
+
+
+def bitmap_sub_image(images, cue, start_time):
+    """The rendered subtitle image showing during cue: the last change at or
+    before its midpoint, as long as it's from this cue."""
+    start, mid = cue.start + start_time, cue.mid + start_time
+    shown = [t for t in images if start - 0.01 <= t <= mid]
+    if not shown:
+        raise RuntimeError(f"no subtitle image for the cue at {cue.start:.3f}s")
+    return images[max(shown)]
+
+
+def composite_subtitle(frame, sub_png, video_size):
+    """Draw a bitmap subtitle onto a frame. The subtitle canvas is centred on the
+    video, as rips are often cropped while the canvas keeps the original frame
+    size (e.g. 1920x1080 PGS over a 1432x1070 pillarbox crop), then scaled the
+    same way the frame was (e.g. anamorphic DVD video to square pixels)."""
+    from PIL import Image
+
+    sub = Image.open(sub_png).convert("RGBA")
+    bbox = sub.getchannel("A").getbbox()
+    if not bbox:
+        return
+    video_w, video_h = video_size
+    sx, sy = frame.width / video_w, frame.height / video_h
+    x0 = (video_w - sub.width) / 2 + bbox[0]
+    y0 = (video_h - sub.height) / 2 + bbox[1]
+    piece = sub.crop(bbox)
+    piece = piece.resize((max(1, round(piece.width * sx)), max(1, round(piece.height * sy))), Image.LANCZOS)
+    frame.paste(piece, (round(x0 * sx), round(y0 * sy)), piece)
 
 
 def sharpest_frame_time(video, cue, window, start_time, deinterlace):
@@ -566,6 +601,10 @@ def main():
 
         if args.save_subs and renderer == "bitmap" and not shutil.which("tesseract"):
             sys.exit("--save-subs needs tesseract to read bitmap subtitles (brew install tesseract).")
+        if renderer == "bitmap":
+            print("Rendering subtitle images...", flush=True)
+            sub_images = render_bitmap_subs(args.video, args.track, tmp / "subs")
+            video_size = (video_stream["width"], video_stream["height"])
 
         def shoot(i, cue):
             """Take the screenshot; return its name and the subtitle's text (for
@@ -575,24 +614,22 @@ def main():
                 out = out_dir / f"{i:04d}_{timestamp(t)}.{args.format}"
                 render_libass(args.video, t, out, sub_file, fonts_dir, start_time, args.deinterlace)
                 return out.name, cue.text
-            bitmap = renderer == "bitmap"
-            sub_image = tmp / f"sub{i:04d}.png" if bitmap and args.save_subs else None
-            t, img = grab_sharpest(args.video, cue, args.window, args.deinterlace, tmp / f"frames{i:04d}",
-                                   track=args.track if bitmap else None, sub_image=sub_image)
-            if not bitmap:
-                draw_subtitle(img, cue.text, font_path, args.font_scale)
+            t, img = grab_sharpest(args.video, cue, args.window, args.deinterlace, tmp / f"frames{i:04d}")
             out = out_dir / f"{i:04d}_{timestamp(t)}.{args.format}"
-            if sub_image:
-                prepared = tmp / f"ocr{i:04d}.png"
-                has_text = prepare_for_ocr(sub_image, prepared)
-                sub_image.unlink()
-                if not has_text:
+            if renderer != "bitmap":
+                draw_subtitle(img, cue.text, font_path, args.font_scale)
+                save_image(img, out)
+                return out.name, cue.text
+            sub_png = bitmap_sub_image(sub_images, cue, start_time)
+            text = cue.text
+            if args.save_subs:
+                text = tmp / f"ocr{i:04d}.png"
+                if not prepare_for_ocr(sub_png, text):
                     # A subtitle with nothing visible (a glitch on some discs): no screenshot.
                     return None, ""
-                save_image(img, out)
-                return out.name, prepared
+            composite_subtitle(img, sub_png, video_size)
             save_image(img, out)
-            return out.name, cue.text
+            return out.name, text
 
         print(f"{len(cues)} cues, renderer: {renderer}, output: {out_dir}")
         failures = 0
