@@ -91,7 +91,8 @@ def classic_dirs(rows):
     """Map classic iPlayer episodes to the folders batch_shots.py uses for them.
 
     iPlayer calls them e.g. "Season 3: The Daleks' Master Plan: The Nightmare
-    Begins" or "Season 7: Spearhead from Space: Episode 1"; they're matched to
+    Begins", "Season 7: Spearhead from Space: Episode 1" or "Season 5: The Wheel in
+    Space: Episode 1 (Reconstruction)"; they're matched to
     episodes.csv by season, story and part title or number. Unmatched ones are
     left out, with a warning.
     """
@@ -112,8 +113,10 @@ def classic_dirs(rows):
         d = None
         if m:
             story = (int(m[1]), fold(m[2]))
-            part = re.fullmatch(r"(?:part|episode) (\d+)", fold(m[3]))
-            d = by_number.get((*story, int(part[1]))) if part else by_title.get((*story, fold(m[3])))
+            # A reconstruction of a missing episode fills the same slot; animations don't.
+            label = re.sub(r"\s*\(reconstruction\)$", "", fold(m[3]))
+            part = re.fullmatch(r"(?:part|episode) (\d+)", label)
+            d = by_number.get((*story, int(part[1]))) if part else by_title.get((*story, label))
         if d:
             dirs[row["pid"]] = d
         else:

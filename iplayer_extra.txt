@@ -4,3 +4,12 @@
 # The Daleks' Master Plan parts 1 and 3: the library copies have no subtitles.
 https://www.bbc.co.uk/iplayer/episode/p00v250v/doctor-who-19631996-season-3-the-daleks-master-plan-the-nightmare-begins
 https://www.bbc.co.uk/iplayer/episode/p00v252r/doctor-who-19631996-season-3-the-daleks-master-plan-devils-planet
+
+# The Wheel in Space: the library copies have no subtitles. Parts 3 and 6 survive;
+# 1, 2, 4 and 5 are iPlayer's reconstructions.
+https://www.bbc.co.uk/iplayer/episode/p00v2zpk
+https://www.bbc.co.uk/iplayer/episode/p00v2zs0
+https://www.bbc.co.uk/iplayer/episode/p00v2zxf
+https://www.bbc.co.uk/iplayer/episode/p00v302v
+https://www.bbc.co.uk/iplayer/episode/p00v3073
+https://www.bbc.co.uk/iplayer/episode/p00v307t
