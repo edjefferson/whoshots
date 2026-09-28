@@ -1,0 +1,10 @@
+# For analyse.py only (Mac); install into .venv-analysis (Python 3.12).
+numpy
+pillow
+opencv-python-headless
+onnxruntime
+insightface
+torch
+open_clip_torch
+scikit-learn
+hdbscan

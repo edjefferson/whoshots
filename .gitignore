@@ -44,6 +44,7 @@ whobot.session
 __pycache__/
 *.py[cod]
 .venv/
+.venv-analysis/
 venv/
 *.egg-info/
 .pytest_cache/
@@ -67,3 +68,8 @@ episodes.csv
 
 # Working files for one-off specials
 work/
+
+# Image analysis (analyse.py)
+analysis.db*
+embeddings.db*
+review/
