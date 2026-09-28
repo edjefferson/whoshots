@@ -230,7 +230,9 @@ def step_faces(db, shots):
     shots = todo(db, "faces", shots)
     if not shots:
         return
-    print("  faces    loading the face model (the first time, it downloads about 300 MB)...", flush=True)
+    first = not (Path.home() / ".insightface/models/buffalo_l").is_dir()
+    print("  faces    " + ("downloading the face model (about 300 MB, this time only)..." if first
+                         else "loading the face model..."), flush=True)
     import warnings
     warnings.filterwarnings("ignore", category=FutureWarning)  # an insightface/scikit-image deprecation, every face
     app = face_app()
@@ -294,7 +296,9 @@ def step_clip(db, shots):
     if not todo_shots:
         tag_shots(db)
         return
-    print("  clip     loading the CLIP model (the first time, it downloads about 600 MB)...", flush=True)
+    first = not any((Path.home() / ".cache/huggingface/hub").glob("models--*" + CLIP_MODEL[0].replace("-", "*") + "*"))
+    print("  clip     " + ("downloading the CLIP model (about 600 MB, this time only)..." if first
+                         else "loading the CLIP model..."), flush=True)
     model, preprocess, tokenizer, device = clip_model()
     prompts = list(TAG_PROMPTS)
     prompt_vecs = text_embeddings(prompts, model, tokenizer, device)
