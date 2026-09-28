@@ -451,7 +451,7 @@ def cluster(db, min_cluster=25):
         if len(ids) < 5:
             continue
         x = np.stack([vecs[i] for i in ids])
-        labels = HDBSCAN(min_cluster_size=5, metric="euclidean").fit_predict(x)
+        labels = HDBSCAN(min_cluster_size=5, metric="euclidean", copy=True).fit_predict(x)
         for lab in set(labels) - {-1}:
             members = [i for i, l in zip(ids, labels) if l == lab]
             c = x[labels == lab].mean(axis=0)
@@ -460,7 +460,7 @@ def cluster(db, min_cluster=25):
 
     # 2. across episodes
     centres = np.stack([c for _, c in groups])
-    labels = HDBSCAN(min_cluster_size=3, metric="euclidean").fit_predict(centres)
+    labels = HDBSCAN(min_cluster_size=3, metric="euclidean", copy=True).fit_predict(centres)
     db.execute("UPDATE faces SET cluster = NULL")
     clusters = {}
     for (members, _), lab in zip(groups, labels):
