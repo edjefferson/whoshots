@@ -239,19 +239,19 @@ def render_bitmap_subs(video, track, workdir, until=None):
 
     Overlaying the subtitle track onto the video in the same ffmpeg run as the
     frame grab occasionally loses every frame, depending on how the two streams'
-    reads happen to line up. Rendering the subtitle track on its own (after
-    copying it out, so ffmpeg needn't read the video) involves no such timing,
-    and the images are composited onto the frames afterwards.
+    reads happen to line up. Rendering the subtitle track on its own involves no
+    such timing, and the images are composited onto the frames afterwards.
+
+    It's read straight from the video with the other streams discarded (so none
+    of the video is decoded), not copied out first: some discs store subtitles
+    out of order (The War Games, Part 3), and copying re-stamps those with the
+    previous subtitle's time, losing them.
     """
     workdir.mkdir()
-    track_file = workdir / "track.mks"
-    # -copyts keeps the original timestamps; otherwise ffmpeg starts the copy at 0.
-    run(["ffmpeg", "-v", "error", "-y", "-copyts", "-i", str(video), "-map", f"0:s:{track}",
-         "-c", "copy", "-f", "matroska", str(track_file)])
     stop = ["-to", f"{until:.3f}"] if until else []  # e.g. with --limit, no need to render the rest
-    proc = run(["ffmpeg", "-hide_banner", "-y", "-copyts", "-i", str(track_file),
-                "-filter_complex", "[0:s:0]format=rgba,showinfo[s]", "-map", "[s]", *stop,
-                "-fps_mode", "passthrough", str(workdir / "s%05d.png")])
+    proc = run(["ffmpeg", "-hide_banner", "-y", "-copyts", "-discard:v", "all", "-discard:a", "all",
+                "-i", str(video), "-filter_complex", f"[0:s:{track}]format=rgba,showinfo[s]", "-map", "[s]",
+                *stop, "-fps_mode", "passthrough", str(workdir / "s%05d.png")])
     images = {}
     # ffmpeg writes the old picture just before each change and the new one at it,
     # so for each time the later frame (the new picture) wins.
