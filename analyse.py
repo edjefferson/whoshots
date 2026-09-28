@@ -6,9 +6,9 @@ and CLIP tags and search. Runs on the Mac, in its own environment:
     uv pip install --python .venv-analysis/bin/python -r requirements-analysis.txt
 
     .venv-analysis/bin/python analyse.py run [--steps quality,faces,clip]
-    .venv-analysis/bin/python analyse.py cluster      # writes review/clusters.html
-    #   ...name the groups you recognise in people.csv...
-    .venv-analysis/bin/python analyse.py label
+    .venv-analysis/bin/python analyse.py cluster      # group faces into likely people
+    .venv-analysis/bin/python analyse.py serve        # name the groups at /people
+    .venv-analysis/bin/python analyse.py label        # (or "Apply names" on that page)
     .venv-analysis/bin/python analyse.py search "a dalek in a corridor"
     .venv-analysis/bin/python analyse.py stats
 
@@ -40,7 +40,6 @@ OUTPUT = HERE / "output"
 ANALYSIS_DB = HERE / "analysis.db"
 EMBEDDINGS_DB = HERE / "embeddings.db"
 REVIEW = HERE / "review"
-PEOPLE_CSV = HERE / "people.csv"
 
 FACE_MIN_SCORE = 0.6    # detection confidence to count as a face
 FACE_MIN_SIZE = 0.03    # a face at least this fraction of the frame height counts
@@ -95,6 +94,10 @@ def connect():
         CREATE TABLE IF NOT EXISTS tag_members (tag TEXT, path TEXT, prob REAL, PRIMARY KEY (tag, path));
         CREATE INDEX IF NOT EXISTS tag_members_path ON tag_members (path);
         CREATE INDEX IF NOT EXISTS faces_cluster ON faces (cluster);
+        -- Names given on the web page's /people, kept per face so they survive re-clustering:
+        -- person = who this face is; not_person = marked as wrong in a group of that name
+        -- ('' if the group was unnamed), so it's never named from its group.
+        CREATE TABLE IF NOT EXISTS face_marks (face_id INTEGER PRIMARY KEY, person TEXT, not_person TEXT);
     """)
     db.execute(f"ATTACH DATABASE ? AS emb", (str(EMBEDDINGS_DB),))
     db.executescript("""
@@ -227,34 +230,38 @@ def step_faces(db, shots):
     warnings.filterwarnings("ignore", category=FutureWarning)  # an insightface/scikit-image deprecation, every face
     app = face_app()
     progress = Progress("faces", len(shots))
-    pending = 0
+    batch = []  # (path, faces, count, largest), written together so the database isn't locked during detection
+
+    def save():
+        for path, faces, count, largest in batch:
+            # In case this shot was partly done before: clear its faces and their embeddings.
+            old = [i for (i,) in db.execute("SELECT id FROM faces WHERE path = ?", (path,))]
+            if old:
+                db.execute(f"DELETE FROM emb.face_embeddings WHERE id IN ({','.join('?' * len(old))})", old)
+                db.execute("DELETE FROM faces WHERE path = ?", (path,))
+            for box, vec in faces:
+                cur = db.execute("INSERT INTO faces (path, x, y, w, h, score) VALUES (?, ?, ?, ?, ?, ?)", (path, *box))
+                db.execute("INSERT OR REPLACE INTO emb.face_embeddings (id, vec) VALUES (?, ?)", (cur.lastrowid, vec))
+            db.execute("UPDATE shots SET face_count=?, largest_face=?, done_faces=1 WHERE path=?", (count, largest, path))
+        db.commit()
+        progress.add(len(batch))
+        batch.clear()
+
     for path, img in prefetch(shots, lambda p: cv2.imread(str(OUTPUT / p))):
-        count, largest = 0, 0.0
-        # In case this shot was partly done before: clear its faces and their embeddings.
-        old = [i for (i,) in db.execute("SELECT id FROM faces WHERE path = ?", (path,))]
-        if old:
-            db.execute(f"DELETE FROM emb.face_embeddings WHERE id IN ({','.join('?' * len(old))})", old)
-            db.execute("DELETE FROM faces WHERE path = ?", (path,))
+        faces, count, largest = [], 0, 0.0
         if img is not None:
             h, w = img.shape[:2]
             for face in app.get(img):
                 x1, y1, x2, y2 = (float(v) for v in face.bbox)
                 fh = (y2 - y1) / h
-                cur = db.execute("INSERT INTO faces (path, x, y, w, h, score) VALUES (?, ?, ?, ?, ?, ?)",
-                                 (path, x1 / w, y1 / h, (x2 - x1) / w, fh, float(face.det_score)))
-                db.execute("INSERT OR REPLACE INTO emb.face_embeddings (id, vec) VALUES (?, ?)",
-                           (cur.lastrowid, blob(face.normed_embedding)))
+                faces.append(((x1 / w, y1 / h, (x2 - x1) / w, fh, float(face.det_score)), blob(face.normed_embedding)))
                 if face.det_score >= FACE_MIN_SCORE and fh >= FACE_MIN_SIZE:
                     count += 1
                     largest = max(largest, fh * (x2 - x1) / w)
-        db.execute("UPDATE shots SET face_count=?, largest_face=?, done_faces=1 WHERE path=?", (count, largest, path))
-        pending += 1
-        if pending >= 200:
-            db.commit()
-            progress.add(pending)
-            pending = 0
-    db.commit()
-    progress.add(pending)
+        batch.append((path, faces, count, largest))
+        if len(batch) >= 200:
+            save()
+    save()
     progress.finish()
 
 
@@ -345,8 +352,9 @@ def train_tag(db, tag, paths, index, matrix, weak_negatives=3000):
     """Fit a tag's classifier to its marked examples, then tag every shot.
 
     Marked ✓ and ✗ shots are the training data; some random unmarked shots are
-    added as weak negatives, since most shots aren't whatever the tag is. Marks
-    always win: ✓ shots are in the tag and ✗ shots out, whatever it predicts.
+    added as weak negatives, since most shots aren't whatever the tag is, so ✗
+    marks are optional (they help with near misses). Marks always win: ✓ shots
+    are in the tag and ✗ shots out, whatever it predicts.
     """
     import datetime
     import random
@@ -358,8 +366,8 @@ def train_tag(db, tag, paths, index, matrix, weak_negatives=3000):
     labels = {p: l for p, l in db.execute("SELECT path, label FROM tag_labels WHERE tag = ?", (tag,)) if p in index}
     pos = [p for p, l in labels.items() if l == 1]
     neg = [p for p, l in labels.items() if l == 0]
-    if len(pos) < 5 or len(neg) < 5:
-        return {"error": f"Mark at least 5 of each first (so far {len(pos)} ✓ and {len(neg)} ✗)."}
+    if len(pos) < 5:
+        return {"error": f"Mark at least 5 ✓ first (so far {len(pos)})."}
     rng = random.Random(0)
     weak = [p for p in rng.sample(paths, min(weak_negatives, len(paths))) if p not in labels]
     marked = pos + neg
@@ -371,10 +379,12 @@ def train_tag(db, tag, paths, index, matrix, weak_negatives=3000):
     model = LogisticRegression(C=2.0, class_weight="balanced", max_iter=2000)
     model.fit(x, y, sample_weight=w)
     # Accuracy on the marked shots alone, by cross-validation (each shot predicted by a
-    # model that didn't see it).
-    folds = min(5, len(pos), len(neg))
-    accuracy = float(cross_val_score(LogisticRegression(C=2.0, class_weight="balanced", max_iter=2000),
-                                     x_marked, y_marked, cv=StratifiedKFold(folds, shuffle=True, random_state=0)).mean())
+    # model that didn't see it); it needs some of each, so none until there are 5 ✗.
+    accuracy = None
+    if len(neg) >= 5:
+        folds = min(5, len(pos), len(neg))
+        accuracy = float(cross_val_score(LogisticRegression(C=2.0, class_weight="balanced", max_iter=2000),
+                                         x_marked, y_marked, cv=StratifiedKFold(folds, shuffle=True, random_state=0)).mean())
     coef = model.coef_[0].astype(np.float32)
     db.execute("UPDATE tag_defs SET coef = ?, intercept = ?, accuracy = ?, trained_at = ? WHERE tag = ?",
                (coef.tobytes(), float(model.intercept_[0]), accuracy,
@@ -420,9 +430,9 @@ def retag(db):
 
 # --- Who's on screen ------------------------------------------------------------------
 
-def cluster(db, min_cluster=25, crops_per_cluster=24):
+def cluster(db, min_cluster=25):
     """Group faces into likely people: HDBSCAN within each episode, then the
-    episode groups' centres across everything. Writes review/clusters.html."""
+    episode groups' centres across everything. Name them on the web page's /people."""
     import numpy as np
     from sklearn.cluster import HDBSCAN
 
@@ -465,7 +475,7 @@ def cluster(db, min_cluster=25, crops_per_cluster=24):
         db.executemany("UPDATE faces SET cluster = ? WHERE id = ?", [(n, i) for i in members])
     db.commit()
     print(f"{len(renumbered)} people-like clusters with at least {min_cluster} faces")
-    write_cluster_page(db, renumbered, crops_per_cluster)
+    print("Name them at http://localhost:8765/people (analyse.py serve).")
 
 
 def face_crop(path, x, y, w, h, size=96):
@@ -481,82 +491,83 @@ def face_crop(path, x, y, w, h, size=96):
     return crop
 
 
-def write_cluster_page(db, clusters, per):
-    import random
-
-    crops_dir = REVIEW / "crops"
-    crops_dir.mkdir(parents=True, exist_ok=True)
-    names = read_people()
-    parts = ["<!doctype html><meta charset=utf-8><title>Face clusters</title>"
-             "<style>body{font:14px system-ui;margin:20px} h2{margin:24px 0 6px}"
-             "img{width:72px;height:72px;object-fit:cover;margin:1px;border-radius:4px}"
-             ".muted{color:#888}</style>",
-             "<h1>Face clusters</h1><p>Name the ones you recognise in <code>people.csv</code> "
-             "(<code>cluster,name</code>), then run <code>analyse.py label</code>.</p>"]
-    for n, members in clusters.items():
-        rows = db.execute(f"SELECT id, path, x, y, w, h FROM faces WHERE id IN ({','.join('?' * len(members))})",
-                          members).fetchall()
-        sample = random.Random(n).sample(rows, min(per, len(rows)))
-        episodes = len({r["path"].rsplit("/", 1)[0] for r in rows})
-        label = f" — <b>{html.escape(names[n])}</b>" if n in names else ""
-        parts.append(f"<h2>Cluster {n}{label}</h2><div class=muted>{len(rows)} faces in {episodes} episodes</div><div>")
-        for r in sample:
-            f = crops_dir / f"{r['id']}.jpg"
-            if not f.exists():
-                face_crop(r["path"], r["x"], r["y"], r["w"], r["h"]).save(f, quality=85)
-            parts.append(f'<img src="crops/{r["id"]}.jpg" title="{html.escape(r["path"])}">')
-        parts.append("</div>")
-    (REVIEW / "clusters.html").write_text("\n".join(parts), encoding="utf-8")
-    print(f"Wrote {REVIEW / 'clusters.html'}")
+def face_crop_file(db, face_id):
+    """A face's crop for the web page, made the first time it's asked for."""
+    f = REVIEW / "crops" / f"{face_id}.jpg"
+    if not f.exists():
+        r = db.execute("SELECT path, x, y, w, h FROM faces WHERE id = ?", (face_id,)).fetchone()
+        if not r:
+            return None
+        f.parent.mkdir(parents=True, exist_ok=True)
+        face_crop(r["path"], r["x"], r["y"], r["w"], r["h"]).save(f, quality=85)
+    return f
 
 
-def read_people():
-    """{cluster number: name} from people.csv."""
-    if not PEOPLE_CSV.exists():
-        return {}
-    with open(PEOPLE_CSV, newline="", encoding="utf-8") as f:
-        return {int(r["cluster"]): r["name"].strip() for r in csv.DictReader(f)
-                if r.get("cluster", "").strip().isdigit() and r.get("name", "").strip()}
+def name_cluster(db, n, name):
+    """Give every face in group n a name (or none), apart from ones marked wrong."""
+    name = " ".join((name or "").split())
+    ids = "SELECT id FROM faces WHERE cluster = ?"
+    if name:
+        db.execute(f"""INSERT INTO face_marks (face_id, person) SELECT id, ? FROM faces WHERE cluster = ?
+                       AND id NOT IN (SELECT face_id FROM face_marks WHERE not_person IS NOT NULL)
+                       ON CONFLICT (face_id) DO UPDATE SET person = excluded.person""", (name, n))
+    else:
+        db.execute(f"DELETE FROM face_marks WHERE face_id IN ({ids}) AND not_person IS NULL", (n,))
+        db.execute(f"UPDATE face_marks SET person = NULL WHERE face_id IN ({ids})", (n,))
+    db.commit()
 
 
-def label(db):
-    """Name every face: the nearest named person's centre, if similar enough; the
-    centre of a name is the average of the clusters given that name."""
+def cluster_names(db):
+    """{group: name}: the name most of a group's faces have, if at least half do."""
+    sizes = dict(db.execute("SELECT cluster, count(*) FROM faces WHERE cluster IS NOT NULL GROUP BY cluster").fetchall())
+    names = {}
+    for n, person, count in db.execute("""SELECT f.cluster, m.person, count(*) FROM faces f JOIN face_marks m ON m.face_id = f.id
+                                          WHERE f.cluster IS NOT NULL AND m.person IS NOT NULL
+                                          GROUP BY f.cluster, m.person ORDER BY count(*)"""):
+        if count * 2 >= sizes[n]:
+            names[n] = person
+    return names
+
+
+def label(db, chunk=20000):
+    """Name every face: faces in named groups get that name; the rest get the
+    nearest person's centre (the average of their named faces), if similar enough."""
     import numpy as np
 
-    names = read_people()
-    if not names:
-        sys.exit(f"No names in {PEOPLE_CSV} (columns: cluster,name).")
-    vecs = {i: vec(b) for i, b in db.execute("SELECT id, vec FROM emb.face_embeddings")}
+    marked = db.execute("""SELECT m.face_id, m.person, e.vec FROM face_marks m
+                           JOIN emb.face_embeddings e ON e.id = m.face_id WHERE m.person IS NOT NULL""").fetchall()
+    if not marked:
+        return {"error": "No faces named yet: name some groups at /people first."}
     centres = {}
-    for n, name in names.items():
-        ids = [i for (i,) in db.execute("SELECT id FROM faces WHERE cluster = ?", (n,))]
-        centres.setdefault(name, []).extend(vecs[i] for i in ids if i in vecs)
+    for r in marked:
+        centres.setdefault(r["person"], []).append(vec(r["vec"]))
     people = sorted(centres)
     matrix = np.stack([np.mean(centres[p], axis=0) / np.linalg.norm(np.mean(centres[p], axis=0)) for p in people])
-    rows = [r for r in db.execute("SELECT id, path, score, h FROM faces") if r["id"] in vecs]
-    ids = [r["id"] for r in rows]
-    x = np.stack([vecs[i] for i in ids])
-    sims = x @ matrix.T
-    best = sims.argmax(axis=1)
+    marks = {r["face_id"]: (r["person"], r["not_person"]) for r in db.execute("SELECT * FROM face_marks")}
     updates, per_shot = [], {}
-    for r, b, s in zip(rows, best, sims[np.arange(len(ids)), best]):
-        name = people[b] if s >= MATCH_THRESHOLD and r["score"] >= FACE_MIN_SCORE else None
-        updates.append((name, r["id"]))
-        if name:
-            per_shot.setdefault(r["path"], set()).add(name)
+    rows = db.execute("SELECT f.id, f.path, f.score, e.vec FROM faces f JOIN emb.face_embeddings e ON e.id = f.id")
+    while batch := rows.fetchmany(chunk):  # in chunks: there are a lot of faces
+        sims = np.stack([vec(r["vec"]) for r in batch]) @ matrix.T
+        for r, row_sims in zip(batch, sims):
+            person, not_person = marks.get(r["id"], (None, None))
+            if not person and r["score"] >= FACE_MIN_SCORE:
+                if not_person in people:
+                    row_sims[people.index(not_person)] = -1
+                best = int(row_sims.argmax())
+                person = people[best] if row_sims[best] >= MATCH_THRESHOLD else None
+            updates.append((person, r["id"]))
+            if person:
+                per_shot.setdefault(r["path"], set()).add(person)
     db.executemany("UPDATE faces SET person = ? WHERE id = ?", updates)
     db.execute("UPDATE shots SET people = NULL")
-    db.executemany("UPDATE shots SET people = ? WHERE path = ?",
-                   [(json.dumps(sorted(v)), p) for p, v in per_shot.items()])
+    db.executemany("UPDATE shots SET people = ? WHERE path = ?", [(json.dumps(sorted(v)), p) for p, v in per_shot.items()])
     db.commit()
     counts = {}
     for name, _ in updates:
         if name:
             counts[name] = counts.get(name, 0) + 1
-    print(f"Labelled {sum(counts.values())} faces in {len(per_shot)} shots:")
-    for name, n in sorted(counts.items(), key=lambda kv: -kv[1]):
-        print(f"  {name}: {n}")
+    return {"faces": sum(counts.values()), "shots": len(per_shot),
+            "people": sorted(counts.items(), key=lambda kv: -kv[1])}
 
 
 # --- Search and stats ---------------------------------------------------------------
@@ -617,8 +628,8 @@ def subtitle_texts():
 
 
 def serve(_, port):
-    """A local web page for browsing and searching the analysed shots (/) and for
-    training tags from marked examples (/tags)."""
+    """A local web page for browsing and searching the analysed shots (/), for
+    training tags from marked examples (/tags) and for naming faces (/people)."""
     import random
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qs, unquote, urlparse
@@ -628,11 +639,11 @@ def serve(_, port):
     print("Reading subtitles...", flush=True)
     texts = subtitle_texts()
     lock = threading.Lock()
-    cache = {"count": -1, "paths": [], "index": {}, "matrix": None, "model": None}
+    cache = {"count": None, "paths": [], "index": {}, "matrix": None, "model": None}
 
     def clip_vectors(db):
         """All CLIP embeddings (float16, to save memory), reloaded when more have been added."""
-        count = db.execute("SELECT count(*) FROM emb.clip_embeddings").fetchone()[0]
+        count = db.execute("SELECT max(rowid) FROM emb.clip_embeddings").fetchone()[0]
         with lock:
             if count != cache["count"]:
                 cache["paths"], cache["index"], cache["matrix"] = clip_matrix(db)
@@ -751,7 +762,9 @@ def serve(_, port):
             order = sorted(labels, key=lambda p: -labels[p])
             probs = tag_probabilities(tag_def, matrix) if tag_def["coef"] else None
         else:
-            if mode == "suggest" or not tag_def["coef"]:
+            if mode != "suggest" and not tag_def["coef"]:
+                return {"total": 0, "shots": []}
+            if mode == "suggest":
                 probs = None
                 score = matvec(matrix, query_vector(tag_def["prompt"] or tag))
                 key = -score
@@ -770,7 +783,67 @@ def serve(_, port):
                 s_["prob"] = float(probs[index[s_["path"]]])
         return {"total": len(order), "shots": shots_out}
 
+    # --- naming faces ---
+
+    def clusters(db, q):
+        """Face groups, biggest first, each with some sample faces to recognise them by."""
+        get = lambda k, d="": q.get(k, [d])[0]
+        show, offset, limit = get("show", "unnamed"), int(get("offset", "0")), int(get("limit", "20"))
+        names = cluster_names(db)
+        sizes = db.execute("SELECT cluster, count(*) FROM faces WHERE cluster IS NOT NULL GROUP BY cluster ORDER BY cluster").fetchall()
+        chosen = [(n, size) for n, size in sizes if show == "all" or (show == "named") == (n in names)]
+        out = []
+        for n, size in chosen[offset:offset + limit]:
+            out.append({"cluster": n, "faces": size, "name": names.get(n), **cluster_faces(db, n, 0, 24)})
+        return {"total": len(chosen), "groups": len(sizes), "named": len(names), "clusters": out}
+
+    def cluster_faces(db, n, offset, limit):
+        rows = db.execute("""SELECT f.id, f.path, m.not_person IS NOT NULL AS wrong FROM faces f
+                             LEFT JOIN face_marks m ON m.face_id = f.id WHERE f.cluster = ?""", (n,)).fetchall()
+        episodes = {}
+        for r in rows:
+            episodes.setdefault(r["path"].rsplit("/", 1)[0], []).append(r)
+        # A spread across episodes: one from each (in a random order), then a second from each, ...
+        rng = random.Random(n)
+        lists = list(episodes.values())
+        rng.shuffle(lists)
+        for faces in lists:
+            rng.shuffle(faces)
+        spread = [faces[i] for i in range(max(map(len, lists), default=0)) for faces in lists if i < len(faces)]
+        seasons = {}
+        for ep, faces in episodes.items():
+            season = " · ".join(ep.split("/")[:2])
+            seasons[season] = seasons.get(season, 0) + len(faces)
+        top = sorted(seasons.items(), key=lambda kv: -kv[1])[:3]
+        return {"episodes": len(episodes), "seasons": [[k, v] for k, v in top],
+                "sample": [{"id": r["id"], "path": r["path"], "wrong": bool(r["wrong"])} for r in spread[offset:offset + limit]]}
+
+    def people_list(db):
+        named = db.execute("SELECT person, count(*) FROM face_marks WHERE person IS NOT NULL GROUP BY person").fetchall()
+        labelled = dict(db.execute("SELECT person, count(*) FROM faces WHERE person IS NOT NULL GROUP BY person").fetchall())
+        return sorted(({"name": p, "marked": n, "labelled": labelled.get(p, 0)} for p, n in named), key=lambda x: -x["marked"])
+
     def post(db, path, body):
+        if path == "/api/name-cluster":
+            name_cluster(db, int(body["cluster"]), body.get("name"))
+            return {"ok": True, "name": cluster_names(db).get(int(body["cluster"]))}
+        if path == "/api/face-wrong":
+            face = int(body["face"])
+            n = db.execute("SELECT cluster FROM faces WHERE id = ?", (face,)).fetchone()[0]
+            name = cluster_names(db).get(n)
+            if body.get("wrong"):
+                db.execute("""INSERT INTO face_marks (face_id, person, not_person) VALUES (?, NULL, ?)
+                              ON CONFLICT (face_id) DO UPDATE SET person = NULL, not_person = excluded.not_person""",
+                           (face, name or ""))
+            else:
+                db.execute("DELETE FROM face_marks WHERE face_id = ?", (face,))
+                if name:
+                    db.execute("INSERT INTO face_marks (face_id, person) VALUES (?, ?)", (face, name))
+            db.commit()
+            return {"ok": True}
+        if path == "/api/apply-names":
+            with lock:  # one at a time: it's a lot of faces
+                return label(db)
         if path == "/api/tags":
             tag = body["tag"].strip().lower()
             if not tag:
@@ -814,8 +887,12 @@ def serve(_, port):
         def do_GET(self):
             url = urlparse(self.path)
             try:
-                if url.path in ("/", "/tags"):
-                    return self.send((PAGE if url.path == "/" else TAGS_PAGE).encode(), "text/html; charset=utf-8")
+                pages = {"/": PAGE, "/tags": TAGS_PAGE, "/people": PEOPLE_PAGE}
+                if url.path in pages:
+                    return self.send(pages[url.path].encode(), "text/html; charset=utf-8")
+                if url.path.startswith("/crop/") and url.path[6:].isdigit():
+                    file = face_crop_file(connect(), int(url.path[6:]))
+                    return self.send(file.read_bytes(), "image/jpeg") if file else self.send(b"not found", "text/plain", 404)
                 if url.path.startswith("/img/"):
                     file = (OUTPUT / unquote(url.path[5:])).resolve()
                     if OUTPUT.resolve() not in file.parents or not file.is_file():
@@ -824,7 +901,9 @@ def serve(_, port):
                 db = connect()
                 q = parse_qs(url.query)
                 handlers = {"/api/options": lambda: options(db), "/api/shots": lambda: shots(db, q),
-                            "/api/tags": lambda: tags(db), "/api/candidates": lambda: candidates(db, q)}
+                            "/api/tags": lambda: tags(db), "/api/candidates": lambda: candidates(db, q),
+                            "/api/clusters": lambda: clusters(db, q), "/api/people": lambda: people_list(db),
+                            "/api/cluster-faces": lambda: cluster_faces(db, int(q["cluster"][0]), int(q.get("offset", ["0"])[0]), 48)}
                 self.reply(handlers[url.path]() if url.path in handlers else None)
             except Exception as e:  # show errors in the page rather than hanging
                 self.send(json.dumps({"error": f"{type(e).__name__}: {e}"}).encode(), "application/json", 500)
@@ -840,7 +919,7 @@ def serve(_, port):
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"Open http://localhost:{port}  (tag training: http://localhost:{port}/tags; Ctrl-C to stop)", flush=True)
+    print(f"Open http://localhost:{port}  (tags: /tags, naming faces: /people; Ctrl-C to stop)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -877,7 +956,7 @@ button { cursor:pointer } button.primary { background:var(--accent); color:#fff;
 @media (max-width:760px) { #detail .inner { grid-template-columns:1fr } }
 </style></head><body>
 <header>
-  <h1>Shot inspector</h1><a href="/tags">Train tags →</a>
+  <h1>Shot inspector</h1><a href="/tags">Train tags →</a> <a href="/people">Name faces →</a>
   <input id="q" placeholder="Describe a shot, e.g. a Dalek in a corridor" autocomplete="off">
   <select id="programme"><option value="">All programmes</option></select>
   <select id="faces"><option value="">Any faces</option><option value="any">With faces</option><option value="2">2+ faces</option><option value="none">No faces</option></select>
@@ -1008,7 +1087,7 @@ const api = async (url, body) => { const r = await fetch(url, body ? { method: "
 async function loadTags() {
   const tags = await api("/api/tags");
   $("#tags").innerHTML = tags.map(t => `<div class="tag ${t.tag === current ? "on" : ""}" data-t="${esc(t.tag)}"><b>${esc(t.tag)}</b>
-    <small>${t.yes} ✓ · ${t.no} ✗ · ${t.trained ? `${t.members.toLocaleString()} tagged · ~${(t.accuracy * 100).toFixed(0)}% accurate` : "not trained yet"}</small></div>`).join("")
+    <small>${t.yes} ✓ · ${t.no} ✗ · ${t.trained ? `${t.members.toLocaleString()} tagged` + (t.accuracy != null ? ` · ~${(t.accuracy * 100).toFixed(0)}% accurate` : "") : "not trained yet"}</small></div>`).join("")
     || "<p style='color:var(--muted)'>No tags yet.</p>";
 }
 async function loadShots() {
@@ -1020,7 +1099,7 @@ async function loadShots() {
                  tagged: "shots the tag currently includes, not yet marked", marked: "everything you've marked" }[mode];
   $("#msg").textContent = `${d.total.toLocaleString()} shots: ${hint}` + (offset ? ` (from #${offset + 1})` : "");
   $("#grid").innerHTML = d.shots.map(s => `<div class="card ${s.label === 1 ? "yes" : s.label === 0 ? "no" : ""}" data-p="${esc(s.path)}">
-      ${s.prob != null ? `<span class="prob">${(s.prob * 100).toFixed(0)}%</span>` : ""}
+      ${s.prob != null ? `<span class="prob">${(s.prob * 100).toFixed(1)}% · ${s.prob >= 0.5 ? "in" : "out"}</span>` : ""}
       <div class="row"><button data-l="1" title="has it">✓</button><button data-l="0" title="doesn't">✗</button></div>
       <img loading="lazy" src="/img/${encodeURI(s.path)}"><div class="sub">${esc(s.text)}</div></div>`).join("")
     || `<div class="empty">Nothing here${mode === "unsure" || mode === "tagged" ? " yet: train the tag first" : ""}.</div>`;
@@ -1032,8 +1111,8 @@ $("#grid").addEventListener("click", async e => {
   if (e.target.tagName === "IMG") { $("#zoom img").src = e.target.src; $("#zoom").style.display = "grid"; return; }
   const b = e.target.closest("button"); if (!b) return;
   const label = +b.dataset.l, same = card.classList.contains(label ? "yes" : "no");
-  await api("/api/label", { tag: current, path: card.dataset.p, label: same ? null : label });
   card.classList.toggle("yes", !same && label === 1); card.classList.toggle("no", !same && label === 0);
+  await api("/api/label", { tag: current, path: card.dataset.p, label: same ? null : label });
   loadTags();
 });
 $("#zoom").onclick = () => $("#zoom").style.display = "none";
@@ -1044,8 +1123,12 @@ $("#train").onclick = async () => {
   if (!current) return;
   $("#msg").textContent = "Training…";
   const r = await api("/api/train", { tag: current });
-  $("#msg").textContent = r.error || `Trained on ${r.positives} ✓ and ${r.negatives} ✗: about ${(r.accuracy * 100).toFixed(0)}% accurate on your marks; ${r.members.toLocaleString()} shots tagged. Mark some Unsure shots and train again to improve it.`;
+  if (r.error) { $("#msg").textContent = r.error; return; }
   loadTags();
+  // New predictions mean a new set of shots to mark: show them from the top.
+  if (mode === "suggest") { mode = "unsure"; document.querySelectorAll(".modes button").forEach(x => x.classList.toggle("on", x.dataset.m === mode)); }
+  offset = 0; await loadShots(); window.scrollTo(0, 0);
+  $("#msg").textContent = `Trained on ${r.positives} ✓ and ${r.negatives} ✗` + (r.accuracy != null ? `: about ${(r.accuracy * 100).toFixed(0)}% accurate on your marks` : "") + `; ${r.members.toLocaleString()} shots tagged. ` + $("#msg").textContent;
 };
 $("#del").onclick = async () => { if (!current || !confirm(`Delete the tag "${current}" and its marks?`)) return;
   await api("/api/delete-tag", { tag: current }); current = null;
@@ -1057,6 +1140,131 @@ $("#new").onsubmit = async e => { e.preventDefault();
   document.querySelectorAll(".modes button").forEach(x => x.classList.toggle("on", x.dataset.m === "suggest"));
   await loadTags(); loadShots(); };
 loadTags();
+</script></body></html>
+"""
+
+
+PEOPLE_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Naming faces</title>
+<style>
+:root { --bg:#f6f5f2; --panel:#fff; --text:#1d1d1f; --muted:#6e6e73; --line:#e3e1dc; --accent:#0a66c2; --yes:#1f9d55; --no:#d64545; }
+@media (prefers-color-scheme: dark) { :root { --bg:#141414; --panel:#1f1f1f; --text:#ececec; --muted:#9a9a9a; --line:#333; --accent:#5aa2ff; --yes:#35c46f; --no:#ff6b6b; } }
+* { box-sizing:border-box }
+body { margin:0; font:14px/1.4 -apple-system, system-ui, sans-serif; background:var(--bg); color:var(--text); display:grid; grid-template-columns:260px 1fr; min-height:100vh }
+aside { background:var(--panel); border-right:1px solid var(--line); padding:14px; position:sticky; top:0; height:100vh; overflow:auto }
+aside h1 { font-size:16px; margin:0 0 4px } aside a { font-size:13px } .muted { color:var(--muted) }
+input, button { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--text) }
+button { cursor:pointer } .primary { background:var(--accent); color:#fff; border-color:var(--accent) }
+.modes { display:flex; gap:4px; margin:12px 0 } .modes button.on { background:var(--accent); color:#fff; border-color:var(--accent) }
+.person { display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px solid var(--line); font-size:13px }
+main { padding:14px 18px; min-width:0 }
+#msg { color:var(--muted); margin:0 0 12px }
+.group { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:12px }
+.group.done { border-color:var(--yes) }
+.head { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:8px }
+.head .info { flex:1 1 260px; font-size:13px } .head input { width:220px }
+.saved { color:var(--yes); font-size:13px }
+.faces { display:flex; flex-wrap:wrap; gap:3px }
+.face { position:relative; width:72px; height:72px; cursor:pointer } .face img { width:72px; height:72px; object-fit:cover; border-radius:4px; display:block }
+.face.wrong img { opacity:.35 } .face.wrong::after { content:"✗"; position:absolute; inset:0; display:grid; place-items:center; color:var(--no); font-size:32px; font-weight:bold }
+.more { margin-top:6px; font-size:12px }
+#next { display:block; margin:8px auto 30px }
+#zoom { position:fixed; inset:0; background:rgba(0,0,0,.8); display:none; place-items:center; z-index:9 } #zoom img { max-width:95vw; max-height:95vh }
+@media (max-width:700px) { body { grid-template-columns:1fr } aside { position:static; height:auto } .head input { width:100% } }
+</style></head><body>
+<aside>
+  <h1>Naming faces</h1><a href="/">← Shot inspector</a> · <a href="/tags">Tags</a>
+  <div class="modes"><button data-s="unnamed" class="on">Unnamed</button><button data-s="named">Named</button><button data-s="all">All</button></div>
+  <p id="counts" class="muted"></p>
+  <button class="primary" id="apply" style="width:100%">Apply names to all faces</button>
+  <p id="applied" class="muted" style="font-size:12px"></p>
+  <p class="muted" style="font-size:12px">Each group is faces that look like the same person, biggest first. Type a name and press
+  Enter; give two groups the same name if they're the same person (e.g. in black and white and in colour). Click a face that
+  doesn't belong to mark it wrong (click again to undo); shift-click to see the whole shot. Skip anyone you don't know.
+  Then <b>Apply names</b>: every face, grouped or not, gets the name of the person it looks most like, if it's close enough.</p>
+  <h3 style="font-size:14px">People</h3><div id="people"></div>
+</aside>
+<main>
+  <div id="msg">Loading…</div>
+  <div id="groups"></div>
+  <button id="next" hidden>Next groups →</button>
+</main>
+<datalist id="names"></datalist>
+<div id="zoom"><img></div>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const api = async (url, body) => { const r = await fetch(url, body ? { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) } : {}); return r.json(); };
+let show = "unnamed", offset = 0, shown = 0, total = 0;
+
+const faceHtml = f => `<div class="face ${f.wrong ? "wrong" : ""}" data-id="${f.id}" data-p="${esc(f.path)}" title="${esc(f.path)}"><img loading="lazy" src="/crop/${f.id}"></div>`;
+function groupHtml(g) {
+  const where = g.seasons.map(([k, n]) => `${esc(k.split(" · ").pop())} (${Math.round(n * 100 / g.faces)}%)`).join(", ");
+  return `<section class="group ${g.name ? "done" : ""}" data-n="${g.cluster}" data-named="${g.name ? 1 : 0}" data-loaded="${g.sample.length}">
+    <div class="head"><b>Group ${g.cluster}</b><span class="info muted">${g.faces.toLocaleString()} faces in ${g.episodes} episodes · mostly ${where}</span>
+    <input list="names" placeholder="Who is this?" value="${esc(g.name || "")}"><button class="save">Save</button><span class="saved"></span></div>
+    <div class="faces">${g.sample.map(faceHtml).join("")}</div>
+    ${g.faces > g.sample.length ? `<button class="more">More faces</button>` : ""}</section>`;
+}
+async function load() {
+  $("#msg").textContent = "Loading…"; $("#groups").innerHTML = "";
+  const d = await api(`/api/clusters?show=${show}&offset=${offset}&limit=20`);
+  if (d.error) { $("#msg").textContent = d.error; return; }
+  total = d.total; shown = d.clusters.length;
+  $("#counts").textContent = `${d.named} of ${d.groups} groups named`;
+  $("#msg").textContent = d.groups ? `${d.total} ${show === "all" ? "" : show + " "}groups` + (d.total ? `, showing ${offset + 1}–${offset + shown}` : "")
+    : "No face groups yet: run analyse.py cluster once the faces step has finished.";
+  $("#groups").innerHTML = d.clusters.map(groupHtml).join("");
+  $("#next").hidden = offset + shown >= total;
+  window.scrollTo(0, 0);
+}
+async function loadPeople() {
+  const people = await api("/api/people");
+  $("#people").innerHTML = people.map(p => `<div class="person"><span>${esc(p.name)}</span><span class="muted">${p.labelled ? p.labelled.toLocaleString() + " faces" : "not applied yet"}</span></div>`).join("")
+    || "<p class='muted' style='font-size:13px'>Nobody named yet.</p>";
+  $("#names").innerHTML = people.map(p => `<option value="${esc(p.name)}">`).join("");
+}
+async function save(group) {
+  const name = group.querySelector("input").value.trim();
+  const r = await api("/api/name-cluster", { cluster: +group.dataset.n, name });
+  if (r.error) { group.querySelector(".saved").textContent = r.error; return; }
+  group.classList.toggle("done", !!r.name); group.dataset.named = r.name ? 1 : 0;
+  group.querySelector(".saved").textContent = r.name ? "✓ saved" : "cleared";
+  loadPeople();
+}
+$("#groups").addEventListener("keydown", e => { if (e.key === "Enter" && e.target.matches("input")) { save(e.target.closest(".group")); e.target.blur(); } });
+$("#groups").addEventListener("click", async e => {
+  const group = e.target.closest(".group"); if (!group) return;
+  if (e.target.matches(".save")) return save(group);
+  if (e.target.matches(".more")) {
+    const d = await api(`/api/cluster-faces?cluster=${group.dataset.n}&offset=${group.dataset.loaded}`);
+    group.querySelector(".faces").insertAdjacentHTML("beforeend", d.sample.map(faceHtml).join(""));
+    group.dataset.loaded = +group.dataset.loaded + d.sample.length;
+    if (!d.sample.length || d.sample.length < 48) e.target.remove();
+    return;
+  }
+  const face = e.target.closest(".face"); if (!face) return;
+  if (e.shiftKey) { $("#zoom img").src = "/img/" + encodeURI(face.dataset.p); $("#zoom").style.display = "grid"; return; }
+  const wrong = !face.classList.contains("wrong");
+  face.classList.toggle("wrong", wrong);
+  await api("/api/face-wrong", { face: +face.dataset.id, wrong });
+});
+$("#zoom").onclick = () => $("#zoom").style.display = "none";
+document.querySelectorAll(".modes button").forEach(b => b.onclick = () => {
+  show = b.dataset.s; offset = 0; document.querySelectorAll(".modes button").forEach(x => x.classList.toggle("on", x === b)); load(); });
+$("#next").onclick = () => {
+  // groups named (or cleared) on this page have left the list, so don't skip past the ones after them
+  const left = [...document.querySelectorAll(".group")].filter(g => show !== "all" && (g.dataset.named === "1") !== (show === "named")).length;
+  offset += shown - left; load();
+};
+$("#apply").onclick = async () => {
+  $("#applied").textContent = "Applying… (a minute or two)";
+  const r = await api("/api/apply-names", {});
+  $("#applied").textContent = r.error || `Named ${r.faces.toLocaleString()} faces in ${r.shots.toLocaleString()} shots.`;
+  loadPeople();
+};
+load(); loadPeople();
 </script></body></html>
 """
 
@@ -1085,8 +1293,8 @@ def main():
     r.add_argument("--sample", type=int, metavar="N",
                    help="only N random shots from the classic series and N from the new series")
     r.add_argument("--seed", type=int, default=1, help="for --sample (default: 1); change it for different shots")
-    sub.add_parser("cluster", help="group faces into people; writes review/clusters.html")
-    sub.add_parser("label", help="name faces from people.csv")
+    sub.add_parser("cluster", help="group faces into likely people, to name at /people")
+    sub.add_parser("label", help="name every face from the groups named at /people")
     s = sub.add_parser("search", help="find shots by description; writes review/search.html")
     s.add_argument("query")
     s.add_argument("-n", type=int, default=60)
@@ -1119,7 +1327,12 @@ def main():
     elif args.command == "cluster":
         cluster(db)
     elif args.command == "label":
-        label(db)
+        result = label(db)
+        if "error" in result:
+            sys.exit(result["error"])
+        print(f"Labelled {result['faces']:,} faces in {result['shots']:,} shots:")
+        for name, n in result["people"]:
+            print(f"  {name}: {n:,}")
     elif args.command == "search":
         search(db, args.query, args.n)
     elif args.command == "serve":
