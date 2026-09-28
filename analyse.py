@@ -47,25 +47,6 @@ FACE_MIN_SIZE = 0.03    # a face at least this fraction of the frame height coun
 MATCH_THRESHOLD = 0.45  # cosine similarity to a person's centre to be labelled as them
 CLIP_MODEL = ("ViT-B-32", "laion2b_s34b_b79k")
 
-# Zero-shot tags: prompt -> tag. Scores for all are stored and tags worked out from
-# them (see tag_shots), so the rules can be retuned without re-running CLIP.
-TAG_PROMPTS = {
-    "a Dalek": "dalek", "a Cyberman": "cyberman", "a Weeping Angel statue": "weeping angel",
-    "a blue police box": "tardis", "the inside of the TARDIS control room": "tardis interior",
-    "an Ood with tentacles on its face": "ood", "a Sontaran with a domed head": "sontaran",
-    "a monster": "monster", "a robot": "robot", "a spaceship in space": "spaceship",
-    "an explosion": "explosion", "a planet seen from space": "space", "a corridor": "corridor",
-    "a quarry": "quarry", "a forest": "forest", "a beach": "beach", "a city street": "street",
-    "a laboratory": "laboratory", "a control panel with buttons": "control panel",
-    "a close-up of a face": "close-up", "a crowd of people": "crowd", "a soldier with a gun": "soldier",
-    "a cartoon": "animation",
-    "a person screaming": "scream", "a person laughing": "laughing", "a kiss": "kiss", "a dog": "dog",
-    "a car": "car", "a horse": "horse", "a fire": "fire", "snow": "snow", "night time": "night",
-}
-TAG_TOP = 0.03      # a shot gets a tag if it's in the top 3% of all shots for that tag...
-TAG_MARGIN = 0.02   # ...and that tag's score beats the shot's average by this much
-
-
 # --- Shots and databases ----------------------------------------------------------
 
 def all_shots():
@@ -104,6 +85,15 @@ def connect():
             person TEXT
         );
         CREATE INDEX IF NOT EXISTS faces_path ON faces (path);
+        -- Tags trained from marked examples (see the web page's /tags).
+        CREATE TABLE IF NOT EXISTS tag_defs (
+            tag TEXT PRIMARY KEY, prompt TEXT,
+            coef BLOB, intercept REAL,  -- the trained classifier (logistic regression on CLIP embeddings)
+            accuracy REAL, trained_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS tag_labels (tag TEXT, path TEXT, label INTEGER, PRIMARY KEY (tag, path));
+        CREATE TABLE IF NOT EXISTS tag_members (tag TEXT, path TEXT, prob REAL, PRIMARY KEY (tag, path));
+        CREATE INDEX IF NOT EXISTS tag_members_path ON tag_members (path);
         CREATE INDEX IF NOT EXISTS faces_cluster ON faces (cluster);
     """)
     db.execute(f"ATTACH DATABASE ? AS emb", (str(EMBEDDINGS_DB),))
@@ -287,35 +277,27 @@ def text_embeddings(texts, model, tokenizer, device):
 
 
 def step_clip(db, shots):
-    """CLIP image embeddings, and zero-shot tag scores against TAG_PROMPTS."""
-    import numpy as np
+    """CLIP image embeddings, for search and for tags trained on the web page."""
     import torch
     from PIL import Image
 
-    todo_shots = todo(db, "clip", shots)
-    if not todo_shots:
-        tag_shots(db)
+    shots = todo(db, "clip", shots)
+    if not shots:
         return
     first = not any((Path.home() / ".cache/huggingface/hub").glob("models--*" + CLIP_MODEL[0].replace("-", "*") + "*"))
     print("  clip     " + ("downloading the CLIP model (about 600 MB, this time only)..." if first
                          else "loading the CLIP model..."), flush=True)
-    model, preprocess, tokenizer, device = clip_model()
-    prompts = list(TAG_PROMPTS)
-    prompt_vecs = text_embeddings(prompts, model, tokenizer, device)
-    shots = todo_shots
+    model, preprocess, _, device = clip_model()
     progress = Progress("clip", len(shots))
     batch_paths, batch_imgs = [], []
 
     def flush():
         with torch.no_grad():
-            x = torch.stack(batch_imgs).to(device)
-            e = model.encode_image(x)
+            e = model.encode_image(torch.stack(batch_imgs).to(device))
             e = (e / e.norm(dim=-1, keepdim=True)).float().cpu().numpy()
-        scores = e @ prompt_vecs.T
-        for path, v, sc in zip(batch_paths, e, scores):
-            tag_scores = {TAG_PROMPTS[p]: round(float(s), 4) for p, s in zip(prompts, sc)}
-            db.execute("INSERT OR REPLACE INTO emb.clip_embeddings (path, vec) VALUES (?, ?)", (path, blob(v)))
-            db.execute("UPDATE shots SET tag_scores=?, done_clip=1 WHERE path=?", (json.dumps(tag_scores), path))
+        db.executemany("INSERT OR REPLACE INTO emb.clip_embeddings (path, vec) VALUES (?, ?)",
+                       [(p, blob(v)) for p, v in zip(batch_paths, e)])
+        db.executemany("UPDATE shots SET done_clip=1 WHERE path=?", [(p,) for p in batch_paths])
         db.commit()
         progress.add(len(batch_paths))
         batch_paths.clear()
@@ -329,29 +311,111 @@ def step_clip(db, shots):
     if batch_paths:
         flush()
     progress.finish()
-    tag_shots(db)
+    if db.execute("SELECT count(*) FROM tag_defs WHERE coef IS NOT NULL").fetchone()[0]:
+        retag(db)  # put the new shots through the trained tags
 
 
-def tag_shots(db):
-    """Tags: for each tag, the shots in the top TAG_TOP of all shots for it, if that
-    score also stands out from the shot's other scores by TAG_MARGIN. (CLIP's raw
-    scores sit close together, so a fixed threshold would tag nearly everything.)"""
+# --- Tags trained from examples --------------------------------------------------
+
+def clip_matrix(db):
+    """(paths, {path: row}, float16 matrix) of every CLIP embedding."""
     import numpy as np
 
-    rows = db.execute("SELECT path, tag_scores FROM shots WHERE tag_scores IS NOT NULL").fetchall()
-    if not rows:
-        return
-    names = [t for t in json.loads(rows[0]["tag_scores"]) if t in TAG_PROMPTS.values()]
-    scores = np.array([[json.loads(r["tag_scores"]).get(t, 0) for t in names] for r in rows])
-    cutoffs = np.quantile(scores, 1 - TAG_TOP, axis=0)
-    means = scores.mean(axis=1, keepdims=True)
-    keep = (scores >= cutoffs) & (scores - means >= TAG_MARGIN)
-    updates = []
-    for r, row_scores, row_keep in zip(rows, scores, keep):
-        tags = [names[i] for i in np.argsort(-row_scores) if row_keep[i]]
-        updates.append((json.dumps(tags), r["path"]))
-    db.executemany("UPDATE shots SET tags=? WHERE path=?", updates)
+    rows = db.execute("SELECT path, vec FROM emb.clip_embeddings").fetchall()
+    paths = [r[0] for r in rows]
+    matrix = np.stack([np.frombuffer(r[1], dtype=np.float16) for r in rows]) if rows else None
+    return paths, {p: i for i, p in enumerate(paths)}, matrix
+
+
+def matvec(matrix, v, chunk=50000):
+    """matrix @ v, in float32 chunks (the matrix is kept in float16 to save memory)."""
+    import numpy as np
+
+    return np.concatenate([matrix[i:i + chunk].astype(np.float32) @ v for i in range(0, len(matrix), chunk)])
+
+
+def tag_probabilities(tag_def, matrix):
+    import numpy as np
+
+    coef = np.frombuffer(tag_def["coef"], dtype=np.float32)
+    return 1 / (1 + np.exp(-(matvec(matrix, coef) + tag_def["intercept"])))
+
+
+def train_tag(db, tag, paths, index, matrix, weak_negatives=3000):
+    """Fit a tag's classifier to its marked examples, then tag every shot.
+
+    Marked ✓ and ✗ shots are the training data; some random unmarked shots are
+    added as weak negatives, since most shots aren't whatever the tag is. Marks
+    always win: ✓ shots are in the tag and ✗ shots out, whatever it predicts.
+    """
+    import datetime
+    import random
+
+    import numpy as np
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import StratifiedKFold, cross_val_score
+
+    labels = {p: l for p, l in db.execute("SELECT path, label FROM tag_labels WHERE tag = ?", (tag,)) if p in index}
+    pos = [p for p, l in labels.items() if l == 1]
+    neg = [p for p, l in labels.items() if l == 0]
+    if len(pos) < 5 or len(neg) < 5:
+        return {"error": f"Mark at least 5 of each first (so far {len(pos)} ✓ and {len(neg)} ✗)."}
+    rng = random.Random(0)
+    weak = [p for p in rng.sample(paths, min(weak_negatives, len(paths))) if p not in labels]
+    marked = pos + neg
+    x_marked = matrix[[index[p] for p in marked]].astype(np.float32)
+    y_marked = np.array([1] * len(pos) + [0] * len(neg))
+    x = np.concatenate([x_marked, matrix[[index[p] for p in weak]].astype(np.float32)])
+    y = np.concatenate([y_marked, np.zeros(len(weak), dtype=int)])
+    w = np.concatenate([np.ones(len(marked)), np.full(len(weak), 0.1)])
+    model = LogisticRegression(C=2.0, class_weight="balanced", max_iter=2000)
+    model.fit(x, y, sample_weight=w)
+    # Accuracy on the marked shots alone, by cross-validation (each shot predicted by a
+    # model that didn't see it).
+    folds = min(5, len(pos), len(neg))
+    accuracy = float(cross_val_score(LogisticRegression(C=2.0, class_weight="balanced", max_iter=2000),
+                                     x_marked, y_marked, cv=StratifiedKFold(folds, shuffle=True, random_state=0)).mean())
+    coef = model.coef_[0].astype(np.float32)
+    db.execute("UPDATE tag_defs SET coef = ?, intercept = ?, accuracy = ?, trained_at = ? WHERE tag = ?",
+               (coef.tobytes(), float(model.intercept_[0]), accuracy,
+                datetime.datetime.now().isoformat(timespec="seconds"), tag))
     db.commit()
+    members = apply_tag(db, tag, paths, matrix)
+    return {"positives": len(pos), "negatives": len(neg), "accuracy": accuracy, "members": members}
+
+
+def apply_tag(db, tag, paths, matrix):
+    """Put every shot through a trained tag; returns how many are in it."""
+    tag_def = db.execute("SELECT * FROM tag_defs WHERE tag = ?", (tag,)).fetchone()
+    probs = tag_probabilities(tag_def, matrix)
+    labels = dict(db.execute("SELECT path, label FROM tag_labels WHERE tag = ?", (tag,)).fetchall())
+    members = [(tag, p, float(pr)) for p, pr in zip(paths, probs)
+               if labels.get(p, 1 if pr >= 0.5 else 0) == 1]
+    db.execute("DELETE FROM tag_members WHERE tag = ?", (tag,))
+    db.executemany("INSERT INTO tag_members (tag, path, prob) VALUES (?, ?, ?)", members)
+    db.commit()
+    rebuild_shot_tags(db)
+    return len(members)
+
+
+def rebuild_shot_tags(db):
+    """shots.tags (for copying elsewhere) from the trained tags' members."""
+    db.execute("UPDATE shots SET tags = NULL")
+    per_shot = {}
+    for tag, path in db.execute("SELECT tag, path FROM tag_members ORDER BY tag"):
+        per_shot.setdefault(path, []).append(tag)
+    db.executemany("UPDATE shots SET tags = ? WHERE path = ?", [(json.dumps(t), p) for p, t in per_shot.items()])
+    db.commit()
+
+
+def retag(db):
+    """Re-apply every trained tag to all shots (e.g. after new shots were analysed)."""
+    paths, _, matrix = clip_matrix(db)
+    if matrix is None:
+        return
+    rebuild_shot_tags(db)  # clears anything left by older versions
+    for (tag,) in db.execute("SELECT tag FROM tag_defs WHERE coef IS NOT NULL").fetchall():
+        print(f"  {tag}: {apply_tag(db, tag, paths, matrix):,} shots")
 
 
 # --- Who's on screen ------------------------------------------------------------------
@@ -533,12 +597,9 @@ def stats(db):
     faces = db.execute("SELECT count(*), count(person) FROM faces").fetchone()
     with_faces = db.execute("SELECT count(*) FROM shots WHERE face_count > 0").fetchone()[0]
     print(f"faces: {faces[0]} found, {faces[1]} named; {with_faces} shots with a clear face")
-    tags = {}
-    for (t,) in db.execute("SELECT tags FROM shots WHERE tags IS NOT NULL"):
-        for tag in json.loads(t):
-            tags[tag] = tags.get(tag, 0) + 1
+    tags = db.execute("SELECT tag, count(*) FROM tag_members GROUP BY tag ORDER BY count(*) DESC").fetchall()
     if tags:
-        print("top tags:", ", ".join(f"{t} {n}" for t, n in sorted(tags.items(), key=lambda kv: -kv[1])[:15]))
+        print("tags:", ", ".join(f"{t} {n:,}" for t, n in tags))
 
 
 # --- Web page ------------------------------------------------------------------
@@ -556,7 +617,8 @@ def subtitle_texts():
 
 
 def serve(_, port):
-    """A local web page for browsing and searching the analysed shots."""
+    """A local web page for browsing and searching the analysed shots (/) and for
+    training tags from marked examples (/tags)."""
     import random
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qs, unquote, urlparse
@@ -569,16 +631,13 @@ def serve(_, port):
     cache = {"count": -1, "paths": [], "index": {}, "matrix": None, "model": None}
 
     def clip_vectors(db):
-        """All CLIP embeddings as a matrix, reloaded when more have been added."""
+        """All CLIP embeddings (float16, to save memory), reloaded when more have been added."""
         count = db.execute("SELECT count(*) FROM emb.clip_embeddings").fetchone()[0]
         with lock:
             if count != cache["count"]:
-                rows = db.execute("SELECT path, vec FROM emb.clip_embeddings").fetchall()
-                cache["paths"] = [r["path"] for r in rows]
-                cache["index"] = {p: i for i, p in enumerate(cache["paths"])}
-                cache["matrix"] = np.stack([vec(r["vec"]) for r in rows]) if rows else None
+                cache["paths"], cache["index"], cache["matrix"] = clip_matrix(db)
                 cache["count"] = count
-            return cache["index"], cache["matrix"]
+            return cache["paths"], cache["index"], cache["matrix"]
 
     def query_vector(text):
         with lock:
@@ -588,20 +647,39 @@ def serve(_, port):
             model, _, tokenizer, device = cache["model"]
             return text_embeddings([text], model, tokenizer, device)[0]
 
+    def shot_json(db, rows, scores=None, tag=None):
+        """The page's view of some shots: subtitle, measurements, faces, tags."""
+        paths = [r["path"] for r in rows]
+        marks = ",".join("?" * len(paths))
+        faces_by, tags_by, labels = {}, {}, {}
+        if paths:
+            for f in db.execute(f"SELECT * FROM faces WHERE path IN ({marks})", paths):
+                faces_by.setdefault(f["path"], []).append({k: f[k] for k in ("x", "y", "w", "h", "score", "cluster", "person")})
+            for m in db.execute(f"SELECT tag, path, prob FROM tag_members WHERE path IN ({marks})", paths):
+                tags_by.setdefault(m["path"], {})[m["tag"]] = m["prob"]
+            if tag:
+                labels = dict(db.execute(f"SELECT path, label FROM tag_labels WHERE tag = ? AND path IN ({marks})",
+                                         [tag, *paths]).fetchall())
+        return [{
+            "path": r["path"], "text": texts.get(r["path"], ""), "score": (scores or {}).get(r["path"]),
+            "brightness": r["brightness"], "contrast": r["contrast"], "sharpness": r["sharpness"],
+            "face_count": r["face_count"], "largest_face": r["largest_face"],
+            "tags": tags_by.get(r["path"], {}), "people": json.loads(r["people"] or "[]"),
+            "faces": faces_by.get(r["path"], []), "label": labels.get(r["path"]),
+        } for r in rows]
+
     def options(db):
-        rows = db.execute("SELECT path, tags, people FROM shots WHERE done_quality OR done_faces OR done_clip").fetchall()
-        tags, people, programmes = {}, {}, {}
+        rows = db.execute("SELECT path, people FROM shots WHERE done_quality OR done_faces OR done_clip").fetchall()
+        people, programmes = {}, {}
         for r in rows:
             programmes[r["path"].split("/")[0]] = programmes.get(r["path"].split("/")[0], 0) + 1
-            for t in json.loads(r["tags"] or "[]"):
-                tags[t] = tags.get(t, 0) + 1
             for p in json.loads(r["people"] or "[]"):
                 people[p] = people.get(p, 0) + 1
+        tags = db.execute("SELECT tag, count(*) FROM tag_members GROUP BY tag ORDER BY count(*) DESC").fetchall()
         clusters = db.execute("SELECT cluster, count(*) FROM faces WHERE cluster IS NOT NULL "
                               "GROUP BY cluster ORDER BY cluster").fetchall()
         return {"analysed": len(rows), "programmes": programmes, "clusters": [list(c) for c in clusters],
-                "tags": sorted(tags.items(), key=lambda kv: -kv[1]),
-                "people": sorted(people.items(), key=lambda kv: -kv[1])}
+                "tags": [list(t) for t in tags], "people": sorted(people.items(), key=lambda kv: -kv[1])}
 
     def shots(db, q):
         get = lambda k, d="": q.get(k, [d])[0]
@@ -616,7 +694,7 @@ def serve(_, port):
         elif faces == "2":
             where.append("face_count >= 2")
         if get("tag"):
-            where.append("tags LIKE ?"); params.append(f'%"{get("tag")}"%')
+            where.append("path IN (SELECT path FROM tag_members WHERE tag = ?)"); params.append(get("tag"))
         if get("person"):
             where.append("people LIKE ?"); params.append(f'%"{get("person")}"%')
         if get("cluster"):
@@ -625,9 +703,9 @@ def serve(_, port):
         search = get("q").strip()
         scores = {}
         if search:
-            index, matrix = clip_vectors(db)
+            _, index, matrix = clip_vectors(db)
             if matrix is not None:
-                sims = matrix @ query_vector(search)
+                sims = matvec(matrix, query_vector(search))
                 scores = {r["path"]: float(sims[index[r["path"]]]) for r in rows if r["path"] in index}
                 rows = sorted((r for r in rows if r["path"] in scores), key=lambda r: -scores[r["path"]])
         else:
@@ -641,19 +719,84 @@ def serve(_, port):
                 rows = list(rows)
                 random.Random(get("seed", "1")).shuffle(rows)
         offset, limit = int(get("offset", "0")), int(get("limit", "60"))
-        page = rows[offset:offset + limit]
-        paths = [r["path"] for r in page]
-        face_rows = db.execute(f"SELECT * FROM faces WHERE path IN ({','.join('?' * len(paths))})", paths).fetchall() if paths else []
-        faces_by = {}
-        for f in face_rows:
-            faces_by.setdefault(f["path"], []).append({k: f[k] for k in ("x", "y", "w", "h", "score", "cluster", "person")})
-        return {"total": len(rows), "shots": [{
-            "path": r["path"], "text": texts.get(r["path"], ""), "score": scores.get(r["path"]),
-            "brightness": r["brightness"], "contrast": r["contrast"], "sharpness": r["sharpness"],
-            "face_count": r["face_count"], "largest_face": r["largest_face"],
-            "tags": json.loads(r["tags"] or "[]"), "people": json.loads(r["people"] or "[]"),
-            "tag_scores": json.loads(r["tag_scores"] or "{}"), "faces": faces_by.get(r["path"], []),
-        } for r in page]}
+        return {"total": len(rows), "shots": shot_json(db, rows[offset:offset + limit], scores)}
+
+    # --- tag training ---
+
+    def tags(db):
+        out = []
+        for t in db.execute("SELECT * FROM tag_defs ORDER BY tag"):
+            counts = dict(db.execute("SELECT label, count(*) FROM tag_labels WHERE tag = ? GROUP BY label",
+                                     (t["tag"],)).fetchall())
+            members = db.execute("SELECT count(*) FROM tag_members WHERE tag = ?", (t["tag"],)).fetchone()[0]
+            out.append({"tag": t["tag"], "prompt": t["prompt"], "trained": t["coef"] is not None,
+                        "accuracy": t["accuracy"], "yes": counts.get(1, 0), "no": counts.get(0, 0),
+                        "members": members})
+        return out
+
+    def candidates(db, q):
+        """Shots to mark for a tag: suggestions from its description, the ones its
+        classifier is least sure about, what it currently tags, or what's marked."""
+        get = lambda k, d="": q.get(k, [d])[0]
+        tag, mode = get("tag"), get("mode", "suggest")
+        offset, limit = int(get("offset", "0")), int(get("limit", "40"))
+        tag_def = db.execute("SELECT * FROM tag_defs WHERE tag = ?", (tag,)).fetchone()
+        if not tag_def:
+            return {"error": f"No tag called {tag!r}"}
+        paths, index, matrix = clip_vectors(db)
+        if matrix is None:
+            return {"total": 0, "shots": []}
+        labels = dict(db.execute("SELECT path, label FROM tag_labels WHERE tag = ?", (tag,)).fetchall())
+        if mode == "marked":
+            order = sorted(labels, key=lambda p: -labels[p])
+            probs = tag_probabilities(tag_def, matrix) if tag_def["coef"] else None
+        else:
+            if mode == "suggest" or not tag_def["coef"]:
+                probs = None
+                score = matvec(matrix, query_vector(tag_def["prompt"] or tag))
+                key = -score
+            else:
+                probs = tag_probabilities(tag_def, matrix)
+                key = np.abs(probs - 0.5) if mode == "unsure" else -probs
+                if mode == "tagged":
+                    key = np.where(probs >= 0.5, key, np.inf)
+            order = [paths[i] for i in np.argsort(key) if paths[i] not in labels and np.isfinite(key[i])]
+        page = order[offset:offset + limit]
+        rows = {r["path"]: r for r in db.execute(
+            f"SELECT * FROM shots WHERE path IN ({','.join('?' * len(page))})", page)} if page else {}
+        shots_out = shot_json(db, [rows[p] for p in page if p in rows], tag=tag)
+        if probs is not None:
+            for s_ in shots_out:
+                s_["prob"] = float(probs[index[s_["path"]]])
+        return {"total": len(order), "shots": shots_out}
+
+    def post(db, path, body):
+        if path == "/api/tags":
+            tag = body["tag"].strip().lower()
+            if not tag:
+                return {"error": "Give the tag a name."}
+            db.execute("INSERT OR IGNORE INTO tag_defs (tag, prompt) VALUES (?, ?)", (tag, body.get("prompt") or tag))
+            db.execute("UPDATE tag_defs SET prompt = ? WHERE tag = ?", (body.get("prompt") or tag, tag))
+            db.commit()
+            return {"ok": True, "tag": tag}
+        if path == "/api/label":
+            if body.get("label") is None:
+                db.execute("DELETE FROM tag_labels WHERE tag = ? AND path = ?", (body["tag"], body["path"]))
+            else:
+                db.execute("INSERT OR REPLACE INTO tag_labels (tag, path, label) VALUES (?, ?, ?)",
+                           (body["tag"], body["path"], int(body["label"])))
+            db.commit()
+            return {"ok": True}
+        if path == "/api/train":
+            paths, index, matrix = clip_vectors(db)
+            return train_tag(db, body["tag"], paths, index, matrix)
+        if path == "/api/delete-tag":
+            for table in ("tag_defs", "tag_labels", "tag_members"):
+                db.execute(f"DELETE FROM {table} WHERE tag = ?", (body["tag"],))
+            db.commit()
+            rebuild_shot_tags(db)
+            return {"ok": True}
+        return None
 
     class Handler(BaseHTTPRequestHandler):
         def send(self, body, kind, status=200):
@@ -663,32 +806,41 @@ def serve(_, port):
             self.end_headers()
             self.wfile.write(body)
 
+        def reply(self, data):
+            if data is None:
+                return self.send(b"not found", "text/plain", 404)
+            self.send(json.dumps(data).encode(), "application/json", 400 if "error" in data else 200)
+
         def do_GET(self):
             url = urlparse(self.path)
             try:
-                if url.path == "/":
-                    return self.send(PAGE.encode(), "text/html; charset=utf-8")
+                if url.path in ("/", "/tags"):
+                    return self.send((PAGE if url.path == "/" else TAGS_PAGE).encode(), "text/html; charset=utf-8")
                 if url.path.startswith("/img/"):
                     file = (OUTPUT / unquote(url.path[5:])).resolve()
                     if OUTPUT.resolve() not in file.parents or not file.is_file():
                         return self.send(b"not found", "text/plain", 404)
                     return self.send(file.read_bytes(), "image/png" if file.suffix == ".png" else "image/jpeg")
                 db = connect()
-                if url.path == "/api/options":
-                    data = options(db)
-                elif url.path == "/api/shots":
-                    data = shots(db, parse_qs(url.query))
-                else:
-                    return self.send(b"not found", "text/plain", 404)
-                self.send(json.dumps(data).encode(), "application/json")
+                q = parse_qs(url.query)
+                handlers = {"/api/options": lambda: options(db), "/api/shots": lambda: shots(db, q),
+                            "/api/tags": lambda: tags(db), "/api/candidates": lambda: candidates(db, q)}
+                self.reply(handlers[url.path]() if url.path in handlers else None)
             except Exception as e:  # show errors in the page rather than hanging
+                self.send(json.dumps({"error": f"{type(e).__name__}: {e}"}).encode(), "application/json", 500)
+
+        def do_POST(self):
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                self.reply(post(connect(), urlparse(self.path).path, body))
+            except Exception as e:
                 self.send(json.dumps({"error": f"{type(e).__name__}: {e}"}).encode(), "application/json", 500)
 
         def log_message(self, *args):
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"Open http://localhost:{port}  (Ctrl-C to stop)", flush=True)
+    print(f"Open http://localhost:{port}  (tag training: http://localhost:{port}/tags; Ctrl-C to stop)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -725,7 +877,7 @@ button { cursor:pointer } button.primary { background:var(--accent); color:#fff;
 @media (max-width:760px) { #detail .inner { grid-template-columns:1fr } }
 </style></head><body>
 <header>
-  <h1>Shot inspector</h1>
+  <h1>Shot inspector</h1><a href="/tags">Train tags →</a>
   <input id="q" placeholder="Describe a shot, e.g. a Dalek in a corridor" autocomplete="off">
   <select id="programme"><option value="">All programmes</option></select>
   <select id="faces"><option value="">Any faces</option><option value="any">With faces</option><option value="2">2+ faces</option><option value="none">No faces</option></select>
@@ -755,7 +907,7 @@ function boxes(s) {
     (f.person || f.cluster ? `<span>${esc(f.person || "group " + f.cluster)}</span>` : "") + `</div>`).join("");
 }
 function card(s, i) {
-  const chips = s.people.map(p => `<span class="chip person">${esc(p)}</span>`).join("") + s.tags.map(t => `<span class="chip">${esc(t)}</span>`).join("");
+  const chips = s.people.map(p => `<span class="chip person">${esc(p)}</span>`).join("") + Object.keys(s.tags).map(t => `<span class="chip">${esc(t)}</span>`).join("");
   return `<div class="card" data-i="${i}"><div class="pic"><img loading="lazy" src="/img/${encodeURI(s.path)}">${boxes(s)}</div>
     <div class="meta">${s.score != null ? `<span class="score">${s.score.toFixed(3)}</span>` : ""}<div class="ep">${esc(episode(s.path))}</div>
     <div class="sub">${esc(s.text)}</div><div class="chips">${chips}</div></div></div>`;
@@ -771,15 +923,14 @@ async function load(reset) {
   $("#more").hidden = offset >= data.total;
 }
 function detail(s) {
-  const scores = Object.entries(s.tag_scores).sort((a, b) => b[1] - a[1]);
-  const max = scores.length ? scores[0][1] : 1, min = scores.length ? scores[scores.length - 1][1] : 0;
+  const tags = Object.entries(s.tags).sort((a, b) => b[1] - a[1]);
   const n = v => v == null ? "–" : (+v).toFixed(v > 10 ? 0 : 3);
   $("#detail .inner").innerHTML = `<div><div class="pic"><img src="/img/${encodeURI(s.path)}">${boxes(s)}</div>
       <p class="sub">${esc(s.text)}</p><p class="ep">${esc(s.path)}</p></div>
     <div><h3>Frame</h3><table><tr><td>Brightness</td><td>${n(s.brightness)}</td></tr><tr><td>Contrast</td><td>${n(s.contrast)}</td></tr>
       <tr><td>Sharpness</td><td>${n(s.sharpness)}</td></tr><tr><td>Clear faces</td><td>${s.face_count ?? "–"}</td></tr><tr><td>Largest face</td><td>${n(s.largest_face)}</td></tr></table>
     <h3>Faces</h3><table>${s.faces.map(f => `<tr><td>${esc(f.person || (f.cluster ? "group " + f.cluster : "unknown"))}</td><td>score ${f.score.toFixed(2)}</td><td>height ${(f.h*100).toFixed(0)}%</td></tr>`).join("") || "<tr><td>none</td></tr>"}</table>
-    <h3>Tag scores</h3><table>${scores.map(([t, v]) => `<tr><td>${esc(t)}${s.tags.includes(t) ? " ✓" : ""}</td><td style="width:45%"><div class="bar" style="width:${Math.max(4, (v - min) / (max - min || 1) * 100)}%"></div></td><td>${v.toFixed(3)}</td></tr>`).join("")}</table></div>`;
+    <h3>Tags</h3><table>${tags.map(([t, v]) => `<tr><td>${esc(t)}</td><td style="width:45%"><div class="bar" style="width:${Math.max(4, v * 100)}%"></div></td><td>${(v * 100).toFixed(0)}%</td></tr>`).join("") || "<tr><td>none yet (<a href='/tags'>train some</a>)</td></tr>"}</table></div>`;
   $("#detail").style.display = "block";
 }
 $("#grid").addEventListener("click", e => { const c = e.target.closest(".card"); if (c) detail(last[+c.dataset.i]); });
@@ -795,6 +946,117 @@ $("#more").onclick = () => load(false);
   fill("programme", Object.entries(o.programmes)); fill("tag", o.tags); fill("person", o.people); fill("cluster", o.clusters, v => "Group " + v);
   load(true);
 })();
+</script></body></html>
+"""
+
+
+TAGS_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tag training</title>
+<style>
+:root { --bg:#f6f5f2; --panel:#fff; --text:#1d1d1f; --muted:#6e6e73; --line:#e3e1dc; --accent:#0a66c2; --yes:#1f9d55; --no:#d64545; }
+@media (prefers-color-scheme: dark) { :root { --bg:#141414; --panel:#1f1f1f; --text:#ececec; --muted:#9a9a9a; --line:#333; --accent:#5aa2ff; --yes:#35c46f; --no:#ff6b6b; } }
+* { box-sizing:border-box }
+body { margin:0; font:14px/1.4 -apple-system, system-ui, sans-serif; background:var(--bg); color:var(--text); display:grid; grid-template-columns:260px 1fr; min-height:100vh }
+aside { background:var(--panel); border-right:1px solid var(--line); padding:14px; position:sticky; top:0; height:100vh; overflow:auto }
+aside h1 { font-size:16px; margin:0 0 4px } aside a.back { font-size:13px }
+.tag { padding:8px; border-radius:6px; cursor:pointer; margin:2px 0 } .tag:hover { background:var(--bg) } .tag.on { background:var(--bg); outline:1px solid var(--line) }
+.tag b { display:block } .tag small { color:var(--muted) }
+form { margin-top:14px; display:grid; gap:6px } input, button { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--text) }
+button { cursor:pointer } .primary { background:var(--accent); color:#fff; border-color:var(--accent) }
+main { padding:14px 18px }
+.bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px }
+.modes button.on { background:var(--accent); color:#fff; border-color:var(--accent) }
+#msg { color:var(--muted); margin:6px 0 12px }
+#grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(230px, 1fr)); gap:10px }
+.card { background:var(--panel); border:3px solid transparent; border-radius:8px; overflow:hidden }
+.card.yes { border-color:var(--yes) } .card.no { border-color:var(--no); opacity:.6 }
+.card img { width:100%; display:block; cursor:zoom-in }
+.card .row { display:flex; gap:6px; padding:6px } .card .row button { flex:1; font-size:16px }
+.card .sub { padding:0 8px 8px; font-size:12px; color:var(--muted); white-space:pre-line }
+.prob { float:right; font-size:12px; color:var(--muted); padding:6px 8px 0 }
+.empty { color:var(--muted); padding:30px 0 }
+#zoom { position:fixed; inset:0; background:rgba(0,0,0,.8); display:none; place-items:center; z-index:9 } #zoom img { max-width:95vw; max-height:95vh }
+@media (max-width:700px) { body { grid-template-columns:1fr } aside { position:static; height:auto } }
+</style></head><body>
+<aside>
+  <h1>Tag training</h1><a class="back" href="/">← Shot inspector</a>
+  <div id="tags"></div>
+  <form id="new"><b>New tag</b>
+    <input id="name" placeholder="name, e.g. dalek" required>
+    <input id="prompt" placeholder="description, e.g. a Dalek">
+    <button class="primary">Add</button></form>
+  <p style="color:var(--muted);font-size:12px">Mark shots ✓ (has it) or ✗ (doesn't); click again to unmark. Start with
+  <b>Suggestions</b>; after training, <b>Unsure</b> shows the shots the tag is least certain about, the most useful ones to
+  mark. Aim for 20+ of each, then train again. Your marks always override the prediction.</p>
+</aside>
+<main>
+  <div class="bar"><h2 id="title" style="margin:0 12px 0 0">Pick or add a tag</h2>
+    <span class="modes"><button data-m="suggest" class="on">Suggestions</button> <button data-m="unsure">Unsure</button>
+    <button data-m="tagged">Tagged</button> <button data-m="marked">Marked</button></span>
+    <button class="primary" id="train">Train &amp; apply</button> <button id="more">Next page →</button> <button id="del">Delete tag</button></div>
+  <div id="msg"></div>
+  <div id="grid"></div>
+</main>
+<div id="zoom"><img></div>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let current = null, mode = "suggest", offset = 0;
+const api = async (url, body) => { const r = await fetch(url, body ? { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) } : {}); return r.json(); };
+
+async function loadTags() {
+  const tags = await api("/api/tags");
+  $("#tags").innerHTML = tags.map(t => `<div class="tag ${t.tag === current ? "on" : ""}" data-t="${esc(t.tag)}"><b>${esc(t.tag)}</b>
+    <small>${t.yes} ✓ · ${t.no} ✗ · ${t.trained ? `${t.members.toLocaleString()} tagged · ~${(t.accuracy * 100).toFixed(0)}% accurate` : "not trained yet"}</small></div>`).join("")
+    || "<p style='color:var(--muted)'>No tags yet.</p>";
+}
+async function loadShots() {
+  if (!current) return;
+  $("#msg").textContent = "Loading…";
+  const d = await api(`/api/candidates?tag=${encodeURIComponent(current)}&mode=${mode}&offset=${offset}&limit=40`);
+  if (d.error) { $("#msg").textContent = d.error; return; }
+  const hint = { suggest: "best matches for the description, not yet marked", unsure: "the shots the tag is least sure about, not yet marked",
+                 tagged: "shots the tag currently includes, not yet marked", marked: "everything you've marked" }[mode];
+  $("#msg").textContent = `${d.total.toLocaleString()} shots: ${hint}` + (offset ? ` (from #${offset + 1})` : "");
+  $("#grid").innerHTML = d.shots.map(s => `<div class="card ${s.label === 1 ? "yes" : s.label === 0 ? "no" : ""}" data-p="${esc(s.path)}">
+      ${s.prob != null ? `<span class="prob">${(s.prob * 100).toFixed(0)}%</span>` : ""}
+      <div class="row"><button data-l="1" title="has it">✓</button><button data-l="0" title="doesn't">✗</button></div>
+      <img loading="lazy" src="/img/${encodeURI(s.path)}"><div class="sub">${esc(s.text)}</div></div>`).join("")
+    || `<div class="empty">Nothing here${mode === "unsure" || mode === "tagged" ? " yet: train the tag first" : ""}.</div>`;
+}
+$("#tags").addEventListener("click", e => { const t = e.target.closest(".tag"); if (!t) return; current = t.dataset.t; offset = 0;
+  $("#title").textContent = current; loadTags(); loadShots(); });
+$("#grid").addEventListener("click", async e => {
+  const card = e.target.closest(".card"); if (!card) return;
+  if (e.target.tagName === "IMG") { $("#zoom img").src = e.target.src; $("#zoom").style.display = "grid"; return; }
+  const b = e.target.closest("button"); if (!b) return;
+  const label = +b.dataset.l, same = card.classList.contains(label ? "yes" : "no");
+  await api("/api/label", { tag: current, path: card.dataset.p, label: same ? null : label });
+  card.classList.toggle("yes", !same && label === 1); card.classList.toggle("no", !same && label === 0);
+  loadTags();
+});
+$("#zoom").onclick = () => $("#zoom").style.display = "none";
+document.querySelectorAll(".modes button").forEach(b => b.onclick = () => {
+  mode = b.dataset.m; offset = 0; document.querySelectorAll(".modes button").forEach(x => x.classList.toggle("on", x === b)); loadShots(); });
+$("#more").onclick = () => { offset += 40; loadShots(); window.scrollTo(0, 0); };
+$("#train").onclick = async () => {
+  if (!current) return;
+  $("#msg").textContent = "Training…";
+  const r = await api("/api/train", { tag: current });
+  $("#msg").textContent = r.error || `Trained on ${r.positives} ✓ and ${r.negatives} ✗: about ${(r.accuracy * 100).toFixed(0)}% accurate on your marks; ${r.members.toLocaleString()} shots tagged. Mark some Unsure shots and train again to improve it.`;
+  loadTags();
+};
+$("#del").onclick = async () => { if (!current || !confirm(`Delete the tag "${current}" and its marks?`)) return;
+  await api("/api/delete-tag", { tag: current }); current = null;
+  $("#title").textContent = "Pick or add a tag"; $("#grid").innerHTML = ""; $("#msg").textContent = ""; loadTags(); };
+$("#new").onsubmit = async e => { e.preventDefault();
+  const r = await api("/api/tags", { tag: $("#name").value, prompt: $("#prompt").value });
+  if (r.error) { $("#msg").textContent = r.error; return; }
+  current = r.tag; offset = 0; mode = "suggest"; $("#title").textContent = current; $("#name").value = $("#prompt").value = "";
+  document.querySelectorAll(".modes button").forEach(x => x.classList.toggle("on", x.dataset.m === "suggest"));
+  await loadTags(); loadShots(); };
+loadTags();
 </script></body></html>
 """
 
@@ -829,7 +1091,7 @@ def main():
     s.add_argument("query")
     s.add_argument("-n", type=int, default=60)
     sub.add_parser("stats")
-    sub.add_parser("retag", help="recompute tags from stored scores (after changing TAG_MARGIN)")
+    sub.add_parser("retag", help="re-apply the trained tags to every shot (e.g. after analysing new ones)")
     v = sub.add_parser("serve", help="a web page to browse and search the analysed shots")
     v.add_argument("--port", type=int, default=8765)
     args = ap.parse_args()
@@ -863,7 +1125,7 @@ def main():
     elif args.command == "serve":
         serve(db, args.port)
     elif args.command == "retag":
-        tag_shots(db)
+        retag(db)
     else:
         stats(db)
 
