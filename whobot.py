@@ -629,6 +629,14 @@ def prune_images(db, delete):
     if os.environ.get("IMAGES_URL"):
         sys.exit("prune-images only works on a local IMAGES_DIR.")
     root = Path(os.environ["IMAGES_DIR"])
+    # A database that's behind the subtitles.csv files doesn't know about newer
+    # screenshots, and would list them as unused.
+    loaded = {d: (m, s) for d, m, s in db.execute("SELECT dir, csv_mtime, csv_size FROM episodes")}
+    stale = [p.parent.relative_to(root).as_posix() for p, st in find_episodes(root)
+             if loaded.get(p.parent.relative_to(root).as_posix()) != (st.st_mtime, st.st_size)]
+    if stale:
+        sys.exit(f"The database is out of date for {len(stale)} episode(s) (e.g. {stale[0]}); "
+                 f"run build-db first, so current screenshots aren't counted as unused.")
     used = {p for (p,) in db.execute("SELECT path FROM shots")}
     used |= {json.loads(o)["image"] for (o,) in db.execute("SELECT overlay FROM shots WHERE overlay IS NOT NULL")}
     unused = []
