@@ -231,6 +231,8 @@ def step_faces(db, shots):
     if not shots:
         return
     print("  faces    loading the face model (the first time, it downloads about 300 MB)...", flush=True)
+    import warnings
+    warnings.filterwarnings("ignore", category=FutureWarning)  # an insightface/scikit-image deprecation, every face
     app = face_app()
     progress = Progress("faces", len(shots))
     pending = 0
@@ -535,6 +537,278 @@ def stats(db):
         print("top tags:", ", ".join(f"{t} {n}" for t, n in sorted(tags.items(), key=lambda kv: -kv[1])[:15]))
 
 
+# --- Web page ------------------------------------------------------------------
+
+def subtitle_texts():
+    """{shot path: subtitle text} from the episodes' subtitles.csv."""
+    texts = {}
+    for path in OUTPUT.glob("*/*/*/subtitles.csv"):
+        rel = path.parent.relative_to(OUTPUT)
+        with open(path, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                if r["shot"]:
+                    texts[(rel / r["shot"]).as_posix()] = r["text"]
+    return texts
+
+
+def serve(_, port):
+    """A local web page for browsing and searching the analysed shots."""
+    import random
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    import numpy as np
+
+    print("Reading subtitles...", flush=True)
+    texts = subtitle_texts()
+    lock = threading.Lock()
+    cache = {"count": -1, "paths": [], "index": {}, "matrix": None, "model": None}
+
+    def clip_vectors(db):
+        """All CLIP embeddings as a matrix, reloaded when more have been added."""
+        count = db.execute("SELECT count(*) FROM emb.clip_embeddings").fetchone()[0]
+        with lock:
+            if count != cache["count"]:
+                rows = db.execute("SELECT path, vec FROM emb.clip_embeddings").fetchall()
+                cache["paths"] = [r["path"] for r in rows]
+                cache["index"] = {p: i for i, p in enumerate(cache["paths"])}
+                cache["matrix"] = np.stack([vec(r["vec"]) for r in rows]) if rows else None
+                cache["count"] = count
+            return cache["index"], cache["matrix"]
+
+    def query_vector(text):
+        with lock:
+            if cache["model"] is None:
+                print("Loading CLIP for search...", flush=True)
+                cache["model"] = clip_model()
+            model, _, tokenizer, device = cache["model"]
+            return text_embeddings([text], model, tokenizer, device)[0]
+
+    def options(db):
+        rows = db.execute("SELECT path, tags, people FROM shots WHERE done_quality OR done_faces OR done_clip").fetchall()
+        tags, people, programmes = {}, {}, {}
+        for r in rows:
+            programmes[r["path"].split("/")[0]] = programmes.get(r["path"].split("/")[0], 0) + 1
+            for t in json.loads(r["tags"] or "[]"):
+                tags[t] = tags.get(t, 0) + 1
+            for p in json.loads(r["people"] or "[]"):
+                people[p] = people.get(p, 0) + 1
+        clusters = db.execute("SELECT cluster, count(*) FROM faces WHERE cluster IS NOT NULL "
+                              "GROUP BY cluster ORDER BY cluster").fetchall()
+        return {"analysed": len(rows), "programmes": programmes, "clusters": [list(c) for c in clusters],
+                "tags": sorted(tags.items(), key=lambda kv: -kv[1]),
+                "people": sorted(people.items(), key=lambda kv: -kv[1])}
+
+    def shots(db, q):
+        get = lambda k, d="": q.get(k, [d])[0]
+        where, params = ["(done_quality OR done_faces OR done_clip)"], []
+        if get("programme"):
+            where.append("path LIKE ?"); params.append(get("programme") + "/%")
+        faces = get("faces")
+        if faces == "none":
+            where.append("face_count = 0")
+        elif faces == "any":
+            where.append("face_count > 0")
+        elif faces == "2":
+            where.append("face_count >= 2")
+        if get("tag"):
+            where.append("tags LIKE ?"); params.append(f'%"{get("tag")}"%')
+        if get("person"):
+            where.append("people LIKE ?"); params.append(f'%"{get("person")}"%')
+        if get("cluster"):
+            where.append("path IN (SELECT path FROM faces WHERE cluster = ?)"); params.append(int(get("cluster")))
+        rows = db.execute(f"SELECT * FROM shots WHERE {' AND '.join(where)}", params).fetchall()
+        search = get("q").strip()
+        scores = {}
+        if search:
+            index, matrix = clip_vectors(db)
+            if matrix is not None:
+                sims = matrix @ query_vector(search)
+                scores = {r["path"]: float(sims[index[r["path"]]]) for r in rows if r["path"] in index}
+                rows = sorted((r for r in rows if r["path"] in scores), key=lambda r: -scores[r["path"]])
+        else:
+            sort = get("sort", "random")
+            keys = {"sharp": lambda r: -(r["sharpness"] or 0), "blurry": lambda r: r["sharpness"] or 0,
+                    "bright": lambda r: -(r["brightness"] or 0), "dark": lambda r: r["brightness"] or 0,
+                    "faces": lambda r: -(r["largest_face"] or 0)}
+            if sort in keys:
+                rows = sorted(rows, key=keys[sort])
+            else:
+                rows = list(rows)
+                random.Random(get("seed", "1")).shuffle(rows)
+        offset, limit = int(get("offset", "0")), int(get("limit", "60"))
+        page = rows[offset:offset + limit]
+        paths = [r["path"] for r in page]
+        face_rows = db.execute(f"SELECT * FROM faces WHERE path IN ({','.join('?' * len(paths))})", paths).fetchall() if paths else []
+        faces_by = {}
+        for f in face_rows:
+            faces_by.setdefault(f["path"], []).append({k: f[k] for k in ("x", "y", "w", "h", "score", "cluster", "person")})
+        return {"total": len(rows), "shots": [{
+            "path": r["path"], "text": texts.get(r["path"], ""), "score": scores.get(r["path"]),
+            "brightness": r["brightness"], "contrast": r["contrast"], "sharpness": r["sharpness"],
+            "face_count": r["face_count"], "largest_face": r["largest_face"],
+            "tags": json.loads(r["tags"] or "[]"), "people": json.loads(r["people"] or "[]"),
+            "tag_scores": json.loads(r["tag_scores"] or "{}"), "faces": faces_by.get(r["path"], []),
+        } for r in page]}
+
+    class Handler(BaseHTTPRequestHandler):
+        def send(self, body, kind, status=200):
+            self.send_response(status)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            url = urlparse(self.path)
+            try:
+                if url.path == "/":
+                    return self.send(PAGE.encode(), "text/html; charset=utf-8")
+                if url.path.startswith("/img/"):
+                    file = (OUTPUT / unquote(url.path[5:])).resolve()
+                    if OUTPUT.resolve() not in file.parents or not file.is_file():
+                        return self.send(b"not found", "text/plain", 404)
+                    return self.send(file.read_bytes(), "image/png" if file.suffix == ".png" else "image/jpeg")
+                db = connect()
+                if url.path == "/api/options":
+                    data = options(db)
+                elif url.path == "/api/shots":
+                    data = shots(db, parse_qs(url.query))
+                else:
+                    return self.send(b"not found", "text/plain", 404)
+                self.send(json.dumps(data).encode(), "application/json")
+            except Exception as e:  # show errors in the page rather than hanging
+                self.send(json.dumps({"error": f"{type(e).__name__}: {e}"}).encode(), "application/json", 500)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print(f"Open http://localhost:{port}  (Ctrl-C to stop)", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+
+
+PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shot inspector</title>
+<style>
+:root { --bg:#f6f5f2; --panel:#fff; --text:#1d1d1f; --muted:#6e6e73; --line:#e3e1dc; --accent:#0a66c2; --face:#1db954; --weak:#c7c7c7; }
+@media (prefers-color-scheme: dark) { :root { --bg:#141414; --panel:#1f1f1f; --text:#ececec; --muted:#9a9a9a; --line:#333; --accent:#5aa2ff; --face:#35d07f; --weak:#666; } }
+* { box-sizing:border-box }
+body { margin:0; font:14px/1.4 -apple-system, system-ui, sans-serif; background:var(--bg); color:var(--text) }
+header { position:sticky; top:0; z-index:5; background:var(--panel); border-bottom:1px solid var(--line); padding:12px 16px; display:flex; flex-wrap:wrap; gap:8px; align-items:center }
+header h1 { font-size:16px; margin:0 12px 0 0 }
+input, select, button { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--text) }
+#q { flex:1 1 260px }
+button { cursor:pointer } button.primary { background:var(--accent); color:#fff; border-color:var(--accent) }
+#status { color:var(--muted); padding:8px 16px }
+#grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:12px; padding:0 16px 16px }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; cursor:pointer }
+.pic { position:relative; line-height:0 } .pic img { width:100%; display:block }
+.box { position:absolute; border:2px solid var(--face); border-radius:3px } .box.weak { border:1px dashed var(--weak) }
+.box span { position:absolute; left:-2px; top:-18px; font-size:11px; line-height:16px; background:var(--face); color:#000; padding:0 4px; border-radius:3px; white-space:nowrap }
+.meta { padding:8px 10px } .ep { color:var(--muted); font-size:12px } .sub { margin:4px 0; white-space:pre-line }
+.chips { display:flex; flex-wrap:wrap; gap:4px } .chip { font-size:11px; padding:1px 6px; border-radius:10px; background:var(--bg); border:1px solid var(--line) }
+.chip.person { border-color:var(--face) } .score { float:right; color:var(--muted); font-size:12px }
+#more { display:block; margin:0 auto 24px }
+#detail { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; z-index:10; padding:24px; overflow:auto }
+#detail .inner { background:var(--panel); max-width:1100px; margin:0 auto; border-radius:10px; padding:16px; display:grid; grid-template-columns:minmax(0,2fr) minmax(0,1fr); gap:16px }
+#detail table { border-collapse:collapse; width:100%; font-size:13px } #detail td { padding:2px 6px; border-bottom:1px solid var(--line) }
+#detail .bar { height:6px; background:var(--accent); border-radius:3px }
+@media (max-width:760px) { #detail .inner { grid-template-columns:1fr } }
+</style></head><body>
+<header>
+  <h1>Shot inspector</h1>
+  <input id="q" placeholder="Describe a shot, e.g. a Dalek in a corridor" autocomplete="off">
+  <select id="programme"><option value="">All programmes</option></select>
+  <select id="faces"><option value="">Any faces</option><option value="any">With faces</option><option value="2">2+ faces</option><option value="none">No faces</option></select>
+  <select id="tag"><option value="">Any tag</option></select>
+  <select id="person"><option value="">Anyone</option></select>
+  <select id="cluster"><option value="">Any face group</option></select>
+  <select id="sort"><option value="random">Random</option><option value="faces">Biggest face</option><option value="sharp">Sharpest</option><option value="blurry">Blurriest</option><option value="bright">Brightest</option><option value="dark">Darkest</option></select>
+  <button class="primary" id="go">Show</button>
+</header>
+<div id="status">Loading…</div>
+<div id="grid"></div>
+<button id="more" hidden>Show more</button>
+<div id="detail"><div class="inner"></div></div>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let offset = 0, seed = Math.floor(Math.random() * 1e6), last = [];
+
+function params() {
+  const p = new URLSearchParams({ seed, offset, limit: 60 });
+  for (const k of ["q", "programme", "faces", "tag", "person", "cluster", "sort"]) if ($("#" + k).value) p.set(k, $("#" + k).value);
+  return p;
+}
+function episode(path) { const parts = path.split("/"); return parts.slice(0, 3).join(" · "); }
+function boxes(s) {
+  return s.faces.map(f => `<div class="box ${f.score < 0.6 ? "weak" : ""}" style="left:${f.x*100}%;top:${f.y*100}%;width:${f.w*100}%;height:${f.h*100}%">` +
+    (f.person || f.cluster ? `<span>${esc(f.person || "group " + f.cluster)}</span>` : "") + `</div>`).join("");
+}
+function card(s, i) {
+  const chips = s.people.map(p => `<span class="chip person">${esc(p)}</span>`).join("") + s.tags.map(t => `<span class="chip">${esc(t)}</span>`).join("");
+  return `<div class="card" data-i="${i}"><div class="pic"><img loading="lazy" src="/img/${encodeURI(s.path)}">${boxes(s)}</div>
+    <div class="meta">${s.score != null ? `<span class="score">${s.score.toFixed(3)}</span>` : ""}<div class="ep">${esc(episode(s.path))}</div>
+    <div class="sub">${esc(s.text)}</div><div class="chips">${chips}</div></div></div>`;
+}
+async function load(reset) {
+  if (reset) { offset = 0; last = []; $("#grid").innerHTML = ""; }
+  $("#status").textContent = $("#q").value ? "Searching…" : "Loading…";
+  const r = await fetch("/api/shots?" + params()); const data = await r.json();
+  if (data.error) { $("#status").textContent = data.error; return; }
+  $("#grid").insertAdjacentHTML("beforeend", data.shots.map((s, k) => card(s, last.length + k)).join(""));
+  last = last.concat(data.shots); offset += data.shots.length;
+  $("#status").textContent = `${data.total.toLocaleString()} shots` + (data.total > offset ? `, showing ${offset}` : "");
+  $("#more").hidden = offset >= data.total;
+}
+function detail(s) {
+  const scores = Object.entries(s.tag_scores).sort((a, b) => b[1] - a[1]);
+  const max = scores.length ? scores[0][1] : 1, min = scores.length ? scores[scores.length - 1][1] : 0;
+  const n = v => v == null ? "–" : (+v).toFixed(v > 10 ? 0 : 3);
+  $("#detail .inner").innerHTML = `<div><div class="pic"><img src="/img/${encodeURI(s.path)}">${boxes(s)}</div>
+      <p class="sub">${esc(s.text)}</p><p class="ep">${esc(s.path)}</p></div>
+    <div><h3>Frame</h3><table><tr><td>Brightness</td><td>${n(s.brightness)}</td></tr><tr><td>Contrast</td><td>${n(s.contrast)}</td></tr>
+      <tr><td>Sharpness</td><td>${n(s.sharpness)}</td></tr><tr><td>Clear faces</td><td>${s.face_count ?? "–"}</td></tr><tr><td>Largest face</td><td>${n(s.largest_face)}</td></tr></table>
+    <h3>Faces</h3><table>${s.faces.map(f => `<tr><td>${esc(f.person || (f.cluster ? "group " + f.cluster : "unknown"))}</td><td>score ${f.score.toFixed(2)}</td><td>height ${(f.h*100).toFixed(0)}%</td></tr>`).join("") || "<tr><td>none</td></tr>"}</table>
+    <h3>Tag scores</h3><table>${scores.map(([t, v]) => `<tr><td>${esc(t)}${s.tags.includes(t) ? " ✓" : ""}</td><td style="width:45%"><div class="bar" style="width:${Math.max(4, (v - min) / (max - min || 1) * 100)}%"></div></td><td>${v.toFixed(3)}</td></tr>`).join("")}</table></div>`;
+  $("#detail").style.display = "block";
+}
+$("#grid").addEventListener("click", e => { const c = e.target.closest(".card"); if (c) detail(last[+c.dataset.i]); });
+$("#detail").addEventListener("click", e => { if (e.target.id === "detail") e.currentTarget.style.display = "none"; });
+document.addEventListener("keydown", e => { if (e.key === "Escape") $("#detail").style.display = "none"; });
+$("#go").onclick = () => { seed = Math.floor(Math.random() * 1e6); load(true); };
+$("#q").addEventListener("keydown", e => { if (e.key === "Enter") load(true); });
+for (const id of ["programme", "faces", "tag", "person", "cluster", "sort"]) $("#" + id).onchange = () => load(true);
+$("#more").onclick = () => load(false);
+(async () => {
+  const o = await (await fetch("/api/options")).json();
+  const fill = (id, items, label) => items.forEach(([v, n]) => $("#" + id).insertAdjacentHTML("beforeend", `<option value="${esc(v)}">${esc(label ? label(v) : v)} (${n})</option>`));
+  fill("programme", Object.entries(o.programmes)); fill("tag", o.tags); fill("person", o.people); fill("cluster", o.clusters, v => "Group " + v);
+  load(true);
+})();
+</script></body></html>
+"""
+
+
+def is_classic(path):
+    return path.startswith(("Doctor Who (1963", "Doctor Who (1993", "Doctor Who (1996"))
+
+
+def sample_shots(shots, n, seed):
+    """n random shots from the classic series (incl. the 1990s specials) and n from the new series."""
+    import random
+
+    rng = random.Random(seed)
+    classic = [s for s in shots if is_classic(s)]
+    new = [s for s in shots if not is_classic(s)]
+    return sorted(rng.sample(classic, min(n, len(classic))) + rng.sample(new, min(n, len(new))))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
@@ -542,6 +816,9 @@ def main():
     r.add_argument("--steps", default="quality,faces,clip")
     r.add_argument("--limit", type=int, help="only the first N shots (for testing)")
     r.add_argument("--match", help="only shots whose path contains this")
+    r.add_argument("--sample", type=int, metavar="N",
+                   help="only N random shots from the classic series and N from the new series")
+    r.add_argument("--seed", type=int, default=1, help="for --sample (default: 1); change it for different shots")
     sub.add_parser("cluster", help="group faces into people; writes review/clusters.html")
     sub.add_parser("label", help="name faces from people.csv")
     s = sub.add_parser("search", help="find shots by description; writes review/search.html")
@@ -549,6 +826,8 @@ def main():
     s.add_argument("-n", type=int, default=60)
     sub.add_parser("stats")
     sub.add_parser("retag", help="recompute tags from stored scores (after changing TAG_MARGIN)")
+    v = sub.add_parser("serve", help="a web page to browse and search the analysed shots")
+    v.add_argument("--port", type=int, default=8765)
     args = ap.parse_args()
 
     db = connect()
@@ -556,6 +835,8 @@ def main():
         shots = all_shots()
         if args.match:
             shots = [s for s in shots if args.match in s]
+        if args.sample:
+            shots = sample_shots(shots, args.sample, args.seed)
         if args.limit:
             shots = shots[: args.limit]
         steps = {"quality": step_quality, "faces": step_faces, "clip": step_clip}
@@ -575,6 +856,8 @@ def main():
         label(db)
     elif args.command == "search":
         search(db, args.query, args.n)
+    elif args.command == "serve":
+        serve(db, args.port)
     elif args.command == "retag":
         tag_shots(db)
     else:
