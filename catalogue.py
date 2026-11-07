@@ -90,7 +90,7 @@ VERSION_RULES = [
     (r"omnibus", -30, "omnibus"),
     (r"anniversary edition", -30, "anniversary edition"),
     (r"blu-?ray", 2, "Blu-ray"),
-    (r"dvd", 0, "DVD"),
+    (r"dvd", -5, "DVD"),   # below an unlabelled file (the Blu-ray rip), which the same release also holds
 ]
 
 
